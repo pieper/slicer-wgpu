@@ -1,9 +1,12 @@
 """
-slicer_wgpu.volume_renderer -- standalone pygfx-compatible volume renderer
-ported from STEP (https://github.com/pieper/step) with RenderCL-inspired
-fixes.
+slicer_wgpu.demos.single_volume -- standalone pygfx-compatible volume
+renderer ported from STEP (https://github.com/pieper/step) with
+RenderCL-inspired fixes.
 
-Stage 1 scope: single volume.
+This is the original Stage-1 single-volume implementation, kept here as a
+self-contained reference / demo. Production code uses
+slicer_wgpu.scene_renderer (a field-compositing ray tracer that supersedes
+this module). See slicer_wgpu.fields for the per-Field abstraction.
 
 Design:
   * Fullscreen triangle (3 verts, no geometry buffer).

@@ -3,10 +3,13 @@ slicer_wgpu.mrml_bridge -- mirror a Slicer MRML scene into a pygfx view.
 
 Provides:
     PygfxView                            -- widget + renderer + scene + camera
-    DisplayableManager                   -- base class for MRML -> pygfx bridges
-    ModelDisplayableManager              -- vtkMRMLModelNode
-    VolumeRenderingDisplayableManager    -- vtkMRMLVolumeRenderingDisplayNode
-    SegmentationDisplayableManager       -- vtkMRMLSegmentationNode
+    DisplayableManager                   -- base class for MRML -> scene-graph bridges
+    ModelDisplayableManager              -- vtkMRMLModelNode  (mesh)
+    SegmentationDisplayableManager       -- vtkMRMLSegmentationNode (mesh)
+    SceneRendererManager                 -- owns the SceneRenderer + per-Field
+                                            Displayers (vtkMRMLVolumeRenderingDisplayNode,
+                                            vtkMRMLMarkupsFiducialNode, ...).
+                                            Routes pointer events for pick-and-drag.
     CameraDisplayableManager             -- vtkMRMLCameraNode (bidirectional)
     ViewDisplayableManager               -- vtkMRMLViewNode (background, cube)
     DualView                             -- custom layout + managers
@@ -28,7 +31,8 @@ import pygfx
 import pylinalg as la
 from rendercanvas.qt import QRenderWidget
 
-from . import volume_renderer as _volume_renderer
+from .scene_renderer import SceneRenderer
+from .displayers import VolumeRenderingDisplayer, FiducialDisplayer
 
 
 # ------------------------------------------------------------------------
@@ -413,46 +417,181 @@ class ModelDisplayableManager(DisplayableManager):
 # VolumeRenderingDisplayableManager
 # ------------------------------------------------------------------------
 
-class VolumeRenderingDisplayableManager(DisplayableManager):
-    node_class = "vtkMRMLVolumeRenderingDisplayNode"
+class SceneRendererManager:
+    """Owns one SceneRenderer + a set of Displayers; arbitrates structural
+    rebuilds vs. uniform refreshes, and routes pointer events to picking-
+    capable Fields for interactive drag.
 
-    def _extra_watch(self, node, tags):
-        vp = node.GetVolumePropertyNode()
-        if vp is not None:
-            tags.append((vp, vp.AddObserver(vtk.vtkCommand.ModifiedEvent, self._on_node_modified)))
+    This replaces the old per-volume DisplayableManager: instead of one
+    pygfx WorldObject per MRML volume, every contributing MRML node maps
+    to a Field on the single SceneRenderer that does the per-sample
+    compositing.
+    """
 
-    def _add_node(self, node):
-        vol_node = node.GetVolumeNode()
-        if vol_node is None:
-            return None
-        arr = slicer.util.arrayFromVolume(vol_node)
-        if arr is None or arr.size == 0:
-            return None
+    def __init__(self, view):
+        self.view = view
+        self._renderer: SceneRenderer | None = None
+        # Suppress structure-change callbacks while we populate the
+        # displayer list: each Displayer's __init__ scans the scene and
+        # would call back into _rebuild_renderer before _displayers is
+        # assigned.
+        self._initializing = True
+        self._displayers = []
+        self._displayers.append(VolumeRenderingDisplayer(
+            on_structure_changed=self._on_structure_changed,
+            on_field_modified=self._on_field_modified,
+        ))
+        self._displayers.append(FiducialDisplayer(
+            on_structure_changed=self._on_structure_changed,
+            on_field_modified=self._on_field_modified,
+        ))
+        self._initializing = False
+
+        # Active drag state, set by pick on pointer_down
+        self._drag_hit = None
+
+        # Subscribe pointer events for pick-and-drag. We register at the
+        # rendercanvas widget level so we can decide before the controller
+        # whether to consume the event.
+        try:
+            view.renderer.add_event_handler(
+                self._on_pointer_down, "pointer_down", order=-10)
+            view.renderer.add_event_handler(
+                self._on_pointer_move, "pointer_move", order=-10)
+            view.renderer.add_event_handler(
+                self._on_pointer_up, "pointer_up", order=-10)
+        except Exception as e:
+            print(f"SceneRendererManager: pointer handlers failed: {e}")
+
+        # Initial scan already populated displayers with whatever was in
+        # the scene at construction time; build the renderer now.
+        self._rebuild_renderer()
+
+    def cleanup(self):
+        for d in self._displayers:
+            try:
+                d.cleanup()
+            except Exception:
+                pass
+        if self._renderer is not None:
+            try:
+                self.view.remove(self._renderer)
+            except Exception:
+                pass
+            self._renderer = None
+
+    # ----- Structure / refresh routing -----
+
+    def _gather_fields(self):
+        out = []
+        for d in self._displayers:
+            out.extend(d.fields())
+        return out
+
+    def _on_structure_changed(self):
+        if getattr(self, "_initializing", False):
+            return
+        self._rebuild_renderer()
+
+    def _on_field_modified(self, field):
+        if self._renderer is None:
+            return
+        # Per-frame style update: re-fill uniforms for the changed field.
+        for f, s in zip(self._renderer.fields(), self._renderer._slot_indices):
+            if f is field:
+                f.fill_uniforms(self._renderer.material.uniform_buffer, s)
+        self._renderer.material.uniform_buffer.update_full()
+        self._renderer.recompute_scene_bounds()
+        self.view.request_redraw()
+
+    def _rebuild_renderer(self):
+        fields = self._gather_fields()
+
+        # Drop the existing renderer (the SceneMaterial subclass is
+        # specific to the previous field configuration).
+        if self._renderer is not None:
+            try:
+                self.view.remove(self._renderer)
+            except Exception:
+                pass
+            self._renderer = None
+
+        if not fields:
+            self.view.request_redraw()
+            return
 
         try:
-            renderer = _volume_renderer.build_renderer_for_volume(vol_node, node)
+            self._renderer = SceneRenderer.build_for_fields(fields)
         except Exception as e:
-            print(f"VolumeRenderingDisplayableManager: build_renderer_for_volume failed: {e}")
-            return None
-
-        renderer.visible = node.GetVisibility() == 1
-
-        return {
-            "root": renderer, "volume": renderer, "material": renderer.material,
-            "volume_node_id": vol_node.GetID(),
-        }
-
-    def _update_node(self, node, entry):
-        vol_node = node.GetVolumeNode()
-        if vol_node is None:
+            print(f"SceneRendererManager: build_for_fields failed: {e}")
             return
-        nid = node.GetID()
 
-        # Any change (volume swap, TF edit, shade toggle) triggers a full
-        # rebuild -- the renderer's LUT, clim and gradient-opacity LUT are
-        # baked at build time, so swap-out is the simplest correct refresh.
-        self._remove_entry(nid)
-        self._on_node_added(node)
+        self.view.add(self._renderer)
+        self.view.request_redraw()
+
+    # ----- Picking (pointer event handlers) -----
+
+    def _ndc_from_event(self, ev):
+        """Convert a rendercanvas pointer event (logical pixels) to NDC."""
+        sz = self.view.widget.get_logical_size()
+        if sz[0] <= 0 or sz[1] <= 0:
+            return None
+        ndc_x = (float(ev["x"]) / sz[0]) * 2.0 - 1.0
+        ndc_y = 1.0 - (float(ev["y"]) / sz[1]) * 2.0
+        return ndc_x, ndc_y
+
+    def _on_pointer_down(self, ev):
+        # Only left button does pick-and-drag
+        if int(ev.get("button", 0)) != 1:
+            return
+        if self._renderer is None:
+            return
+        ndc = self._ndc_from_event(ev)
+        if ndc is None:
+            return
+        sz = self.view.widget.get_logical_size()
+        hit = self._renderer.pick_at(ndc[0], ndc[1], self.view.camera, sz)
+        if hit is None:
+            return
+        self._drag_hit = hit
+        # Stop the controller from interpreting this as the start of a
+        # rotate. rendercanvas event dicts are mutable; setting a flag
+        # in our own dict is fine, but we can't mark it "consumed" the
+        # way browser events can. Workaround: temporarily disable the
+        # controller while a drag is active.
+        if hasattr(self.view, "controller"):
+            self.view.controller.enabled = False
+
+    def _on_pointer_move(self, ev):
+        if self._drag_hit is None or self._renderer is None:
+            return
+        ndc = self._ndc_from_event(ev)
+        if ndc is None:
+            return
+        sz = self.view.widget.get_logical_size()
+        if self._renderer.drag_continue(self._drag_hit, ndc[0], ndc[1],
+                                        self.view.camera, sz):
+            self.view.request_redraw()
+
+    def _on_pointer_up(self, ev):
+        if self._drag_hit is None:
+            return
+        # On release, push the new sphere position back into MRML via the
+        # owning displayer (FiducialDisplayer.commit_drag).
+        for d in self._displayers:
+            if isinstance(d, FiducialDisplayer):
+                if self._drag_hit.field in d.fields():
+                    d.commit_drag(self._drag_hit.field, self._drag_hit.item_index)
+                    break
+        self._drag_hit = None
+        if hasattr(self.view, "controller"):
+            self.view.controller.enabled = True
+
+    # ----- Test/inspection --------
+
+    @property
+    def renderer(self) -> SceneRenderer | None:
+        return self._renderer
 
 
 # ------------------------------------------------------------------------
@@ -769,9 +908,15 @@ def configure_slicer_controls(controller):
     """
     try:
         controller.controls["mouse1"] = ("rotate", "drag", (0.005, 0.005))
-        controller.controls["mouse3"] = ("pan", "drag", (1.0, 1.0))
+        # Pan multiplier is tuned to match VTK's trackball pan (~1 mm per
+        # screen pixel at a typical volume-view distance). OrbitController's
+        # pan path inflates the raw pixel delta by distance_to_target * 0.01
+        # when _custom_target is set (which our CameraDisplayableManager does
+        # on every MRML sync), so the 0.01 on our side roughly cancels that
+        # inflation and leaves a VTK-equivalent feel regardless of zoom.
+        controller.controls["mouse3"] = ("pan", "drag", (0.01, 0.01))
+        controller.controls["shift+mouse1"] = ("pan", "drag", (0.01, 0.01))
         controller.controls["mouse2"] = ("zoom", "drag", 0.01)
-        controller.controls["shift+mouse1"] = ("pan", "drag", (1.0, 1.0))
         controller.controls["control+mouse1"] = ("zoom", "drag", 0.01)
         controller.controls["wheel"] = ("zoom", "push", -0.001)
         controller.controls["alt+wheel"] = ("fov", "push", -0.01)
@@ -849,10 +994,15 @@ class DualView:
 
     @classmethod
     def uninstall(cls):
-        if cls._instance is None:
+        if cls._instance is not None:
+            cls._instance._uninstall()
+            cls._instance = None
             return
-        cls._instance._uninstall()
-        cls._instance = None
+        # No tracked instance in THIS module -- but a previous import
+        # cycle (sys.modules.pop + re-import) may have orphaned widgets
+        # in the 3D view layout. Sweep those up too, so uninstall() is a
+        # robust "make the layout clean" call regardless of history.
+        cls()._purge_stale_pygfx_widgets()
 
     def _install(self):
         self._register_layout()
@@ -869,15 +1019,38 @@ class DualView:
             self._on_double_click, "double_click"
         )
 
+        # Field-based renderer (volumes + fiducials + future) lives on a
+        # single SceneRenderer driven by Displayers. Mesh-style nodes
+        # (models, segmentations) keep their own scene-graph managers.
         self.managers = [
             ViewDisplayableManager(self.view, layout_name="1"),
             ModelDisplayableManager(self.view),
-            VolumeRenderingDisplayableManager(self.view),
             SegmentationDisplayableManager(self.view),
+            SceneRendererManager(self.view),
             CameraDisplayableManager(self.view, layout_name="1"),
         ]
 
         self.view.reset_camera()
+        # reset_camera() repositioned the pygfx camera (show_object on the
+        # scene) but didn't touch the MRML camera node. Without this push
+        # the right-side VTK view keeps its default camera orientation
+        # while the pygfx pane frames the scene -- the two panes look at
+        # the scene from different angles at install time.
+        self._sync_camera_to_mrml()
+
+    def _sync_camera_to_mrml(self):
+        """Push the current pygfx camera state into the tracked MRML
+        camera node so the paired VTK view mirrors our framing."""
+        cam_mgr = next(
+            (m for m in self.managers if isinstance(m, CameraDisplayableManager)),
+            None,
+        )
+        if cam_mgr is None or cam_mgr._tracked_node_id is None:
+            return
+        node = slicer.mrmlScene.GetNodeByID(cam_mgr._tracked_node_id)
+        if node is None:
+            return
+        cam_mgr._push_pygfx_to_mrml(node)
 
     def _uninstall(self):
         for m in self.managers:
@@ -892,23 +1065,11 @@ class DualView:
                 self.view.close()
             except Exception:
                 pass
-            w = self.view.widget
-            # Remove from the parent layout BEFORE deleteLater. Qt keeps the
-            # widget in its layout slot until the event loop disposes it; if
-            # another install() runs in between we'd end up with stacked
-            # duplicates.
-            try:
-                parent_layout = w.parent().layout() if w.parent() is not None else None
-                if parent_layout is not None:
-                    parent_layout.removeWidget(w)
-            except Exception:
-                pass
-            try:
-                w.hide()
-                w.setParent(None)
-                w.deleteLater()
-            except Exception:
-                pass
+        # Purge our widget *and* any leftover pygfx widgets -- the latter
+        # handles the case where a previous install was orphaned by a
+        # sys.modules reload (old class, old _instance lost, widgets
+        # still parked in the layout). Runs regardless of self.view.
+        self._purge_stale_pygfx_widgets()
         self.view = None
 
         if self._prior_layout is not None:
@@ -924,8 +1085,9 @@ class DualView:
 
     def _on_double_click(self, ev):
         """Toggle maximized-view mode, matching Slicer's native 3D view."""
-        lm = slicer.app.layoutManager()
-        tdw = lm.threeDWidget(0)
+        tdw = self._find_pygfx_threeDWidget()
+        if tdw is None:
+            return
         view_node = tdw.mrmlViewNode() if hasattr(tdw, "mrmlViewNode") else tdw.threeDView().mrmlViewNode()
         layout_node = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLLayoutNode")
         if layout_node is None or view_node is None:
@@ -935,12 +1097,89 @@ class DualView:
         else:
             layout_node.AddMaximizedViewNode(view_node)
 
+    # Distinctive objectName so we can recognise our widgets even across
+    # sys.modules reloads where the DualView class itself gets rebound
+    # (at which point DualView._instance is unreachable from the fresh
+    # module but the Qt widgets stay alive until something removes them).
+    PYGFX_WIDGET_OBJECT_NAME = "slicer_wgpu.DualView.pygfx_widget"
+
+    # Which MRML view-node layoutName designates the pygfx pane. We
+    # bind by layoutName rather than by `threeDWidget(0)` index because
+    # Slicer allocates threeDWidget indices in view-node-creation order,
+    # which isn't correlated with the XML-driven on-screen left/right
+    # placement -- so hardcoding index 0 can flip sides across sessions.
+    PYGFX_VIEW_LAYOUT_NAME = "1"
+
+    def _find_pygfx_threeDWidget(self):
+        """Return the qMRMLThreeDWidget whose view node has layoutName
+        == PYGFX_VIEW_LAYOUT_NAME, i.e. the on-screen slot we own.
+        Returns None if the custom layout isn't active yet."""
+        lm = slicer.app.layoutManager()
+        for i in range(lm.threeDViewCount):
+            tdw = lm.threeDWidget(i)
+            try:
+                view_node = tdw.mrmlViewNode()
+            except Exception:
+                view_node = None
+            if view_node is not None and \
+                    view_node.GetLayoutName() == self.PYGFX_VIEW_LAYOUT_NAME:
+                return tdw
+        return None
+
+    def _purge_stale_pygfx_widgets(self):
+        """Remove every pygfx widget (and every `QRenderWidget`-lookalike)
+        that a previous install() dropped into the pygfx pane's layout,
+        and un-hide the native VTK threeDView. Safe to call whether or
+        not a prior install exists; used both on install (to clean up
+        orphans from reloaded modules) and uninstall."""
+        tdw = self._find_pygfx_threeDWidget()
+        if tdw is None:
+            return
+        layout = tdw.layout()
+        if layout is None:
+            return
+        # Snapshot first -- layout.count() shifts as we remove.
+        victims = []
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget() if layout.itemAt(i) else None
+            if w is None:
+                continue
+            cls = type(w).__name__
+            if (w.objectName == self.PYGFX_WIDGET_OBJECT_NAME
+                    or cls == "QRenderWidget"):
+                victims.append(w)
+        for w in victims:
+            try:
+                layout.removeWidget(w)
+            except Exception:
+                pass
+            try:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+            except Exception:
+                pass
+        # Make sure the native VTK view is visible again.
+        try:
+            tdw.threeDView().show()
+        except Exception:
+            pass
+
     def _inject_widget(self):
         lm = slicer.app.layoutManager()
         if lm.threeDViewCount < 2:
             raise RuntimeError(f"Expected 2 threeDViews in custom layout, got {lm.threeDViewCount}")
-        tdw = lm.threeDWidget(0)
+        tdw = self._find_pygfx_threeDWidget()
+        if tdw is None:
+            raise RuntimeError(
+                f"No threeDWidget with view-node layoutName="
+                f"{self.PYGFX_VIEW_LAYOUT_NAME!r}. Custom layout wasn't applied.")
+        # Sweep out any orphaned pygfx widgets a reloaded-module install
+        # may have left behind; without this the new widget shares the
+        # layout cell with the old one and both render at half height.
+        self._purge_stale_pygfx_widgets()
         tdw.threeDView().hide()
+        self.view.widget.setObjectName(self.PYGFX_WIDGET_OBJECT_NAME)
         tdw.layout().addWidget(self.view.widget)
         self.view.widget.show()
 
