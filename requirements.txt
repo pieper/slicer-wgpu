@@ -1,0 +1,7 @@
+numpy
+wgpu
+pygfx
+# rendercanvas needs the PythonQt patch in 3D Slicer. Until the PR is merged
+# upstream, install this fork first, then `pip install .`:
+#   pip install https://github.com/pieper/rendercanvas/archive/refs/heads/main.zip
+rendercanvas
