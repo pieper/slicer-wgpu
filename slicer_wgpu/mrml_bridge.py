@@ -27,12 +27,19 @@ import slicer
 import vtk
 import vtk.util.numpy_support as vnp
 import qt
-# Force PythonQt into sys.modules BEFORE importing rendercanvas.qt.
-# The pieper/rendercanvas PythonQt fork uses `"PythonQt" in sys.modules`
-# to pick its backend; Slicer's `import qt` shim wraps PythonQt but
-# doesn't reliably put the PythonQt top-level name into sys.modules
-# (depending on build), so we import it explicitly.
+# Tell the pieper/rendercanvas fork to use its PythonQt backend BEFORE
+# rendercanvas.qt is imported. The fork's select_qt_lib() honours this
+# env var first, falling back to `"PythonQt" in sys.modules` detection
+# otherwise -- and the sys.modules path is unreliable on some Slicer
+# builds (Mac preview in particular) where `import PythonQt` works in
+# a Python console but the top-level name isn't surfaced the same way
+# during a scripted module's top-level import.
+import os as _os_env
+_os_env.environ.setdefault("_RENDERCANVAS_QT_LIB", "PythonQt")
+# Still import PythonQt so QApplication.instance() detection works in
+# the fork's qt_lib_has_app() helper.
 import PythonQt  # noqa: F401
+import PythonQt.QtCore  # noqa: F401
 import pygfx
 import pylinalg as la
 from rendercanvas.qt import QRenderWidget
@@ -544,18 +551,30 @@ class SceneRendererManager:
 
     # ----- Picking (pointer event handlers) -----
 
+    @staticmethod
+    def _ev_field(ev, key, default=None):
+        """Read a pointer-event field that may be either a dict entry
+        (older rendercanvas / pygfx) or an attribute (pygfx 0.16+ which
+        delivers pygfx.objects.PointerEvent objects)."""
+        getter = getattr(ev, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return getattr(ev, key, default)
+
     def _ndc_from_event(self, ev):
         """Convert a rendercanvas pointer event (logical pixels) to NDC."""
         sz = self.view.widget.get_logical_size()
         if sz[0] <= 0 or sz[1] <= 0:
             return None
-        ndc_x = (float(ev["x"]) / sz[0]) * 2.0 - 1.0
-        ndc_y = 1.0 - (float(ev["y"]) / sz[1]) * 2.0
+        x = self._ev_field(ev, "x", 0.0)
+        y = self._ev_field(ev, "y", 0.0)
+        ndc_x = (float(x) / sz[0]) * 2.0 - 1.0
+        ndc_y = 1.0 - (float(y) / sz[1]) * 2.0
         return ndc_x, ndc_y
 
     def _on_pointer_down(self, ev):
         # Only left button does pick-and-drag
-        if int(ev.get("button", 0)) != 1:
+        if int(self._ev_field(ev, "button", 0) or 0) != 1:
             return
         if self._renderer is None:
             return
