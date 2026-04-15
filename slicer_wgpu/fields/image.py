@@ -109,6 +109,7 @@ class ImageField(Field):
         shininess: float = 10.0,
         visible: bool = True,
         interpolation: str = "linear",
+        world_from_local: np.ndarray | None = None,
     ):
         super().__init__()
         self._volume_tex = (
@@ -132,6 +133,17 @@ class ImageField(Field):
         self.patient_to_texture = (
             np.eye(4, dtype=np.float32) if patient_to_texture is None
             else np.asarray(patient_to_texture, dtype=np.float32)
+        )
+        # Transform from the volume's local (RAS) space to world space --
+        # i.e. the 4x4 that a vtkMRMLTransformNode.GetMatrixTransformToWorld
+        # returns for the volume. Identity means "volume is parked at the
+        # world origin" (Slicer's default). We fold its inverse into the
+        # sampling matrix at fill_uniforms() time so the WGSL side stays
+        # untouched and the Phong gradient naturally captures any
+        # non-rigid stretch.
+        self.world_from_local = (
+            np.eye(4, dtype=np.float32) if world_from_local is None
+            else np.asarray(world_from_local, dtype=np.float32).reshape(4, 4)
         )
         self.sample_step_mm = float(sample_step_mm)
         self.opacity_unit_distance = float(opacity_unit_distance)
@@ -343,11 +355,37 @@ fn tf_field_img{i}(s: FieldSample) -> vec4<f32> {{
 }}
 """
 
+    # -------- Transform API --------
+
+    def set_world_from_local(self, world_from_local: np.ndarray) -> None:
+        """Update the volume's world-from-local transform (the 4x4 a
+        vtkMRMLTransformNode.GetMatrixTransformToWorld would return).
+        Folded into the sampling matrix on the next uniform refresh.
+        Stretching or skewing this matrix makes the Phong gradient
+        respond to the deformation automatically because the world-space
+        central-difference neighbours map to non-uniformly-spaced
+        texture coords.
+        """
+        M = np.asarray(world_from_local, dtype=np.float32).reshape(4, 4)
+        if np.allclose(M, self.world_from_local):
+            return
+        self.world_from_local = M
+        self.touch()
+
     # -------- CPU-side state --------
 
     def fill_uniforms(self, ub, slot_idx: int) -> None:
         p = f"img{slot_idx}"
-        ub.data[f"{p}_patient_to_texture"] = self.patient_to_texture.T  # column-major
+        # Compose: wp (world) -> (world_to_local) -> (patient_to_texture).
+        # The shader uniform is still called *_patient_to_texture; we just
+        # reuse its slot for the full world-to-texture matrix so no WGSL
+        # change is needed.
+        world_to_local = np.linalg.inv(
+            np.asarray(self.world_from_local, dtype=np.float64))
+        world_to_texture = (
+            np.asarray(self.patient_to_texture, dtype=np.float64) @ world_to_local
+        ).astype(np.float32)
+        ub.data[f"{p}_patient_to_texture"] = world_to_texture.T  # column-major
         cmin, cmax = self.clim
         ub.data[f"{p}_clim"] = np.array([cmin, cmax, 0.0, 0.0], dtype=np.float32)
         gmin, gmax = self.gradient_range
@@ -365,5 +403,20 @@ fn tf_field_img{i}(s: FieldSample) -> vec4<f32> {{
         ub.data[f"{p}_shininess"] = np.float32(self.shininess)
 
     def aabb(self):
-        return (np.asarray(self.bounds_min, dtype=np.float64),
-                np.asarray(self.bounds_max, dtype=np.float64))
+        # If a non-identity transform is set, union the 8 transformed
+        # corners of the local AABB. For identity this collapses to the
+        # plain local bounds; non-rigid transforms expand the AABB as
+        # needed so the ray-march doesn't clip the deformed volume.
+        lo = np.asarray(self.bounds_min, dtype=np.float64)
+        hi = np.asarray(self.bounds_max, dtype=np.float64)
+        M = np.asarray(self.world_from_local, dtype=np.float64)
+        if np.allclose(M, np.eye(4)):
+            return lo, hi
+        corners = np.array([
+            [lo[0], lo[1], lo[2], 1.0], [hi[0], lo[1], lo[2], 1.0],
+            [lo[0], hi[1], lo[2], 1.0], [hi[0], hi[1], lo[2], 1.0],
+            [lo[0], lo[1], hi[2], 1.0], [hi[0], lo[1], hi[2], 1.0],
+            [lo[0], hi[1], hi[2], 1.0], [hi[0], hi[1], hi[2], 1.0],
+        ], dtype=np.float64)
+        w = (M @ corners.T).T[:, :3]
+        return w.min(axis=0), w.max(axis=0)

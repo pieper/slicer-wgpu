@@ -359,7 +359,10 @@ class SceneRenderer(pygfx.WorldObject):
             _fields_for_bindings = fields
             _slot_indices = slot_indices
 
-            def get_bindings(self, wobject, shared, scene):
+            def get_bindings(self, wobject, shared, scene=None):
+                # `scene` arg was added in a pygfx point-release; older
+                # 0.16.x installs still call this with (wobject, shared).
+                # Defaulting to None keeps us compatible with both.
                 bindings = [
                     Binding("u_stdinfo",  "buffer/uniform", shared.uniform_buffer),
                     Binding("u_wobject",  "buffer/uniform", wobject.uniform_buffer),

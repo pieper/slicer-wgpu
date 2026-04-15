@@ -453,13 +453,20 @@ class SceneRendererManager:
         # Subscribe pointer events for pick-and-drag. We register at the
         # rendercanvas widget level so we can decide before the controller
         # whether to consume the event.
+        # pygfx 0.16 added `order=` so our handlers run before the
+        # controller's. On older (0.15.x) builds the kwarg isn't
+        # accepted, so fall back to registering without it — we lose
+        # priority but pick/drag still works because the controller
+        # accepts/ignores based on button.
+        def _add(handler, kind):
+            try:
+                view.renderer.add_event_handler(handler, kind, order=-10)
+            except TypeError:
+                view.renderer.add_event_handler(handler, kind)
         try:
-            view.renderer.add_event_handler(
-                self._on_pointer_down, "pointer_down", order=-10)
-            view.renderer.add_event_handler(
-                self._on_pointer_move, "pointer_move", order=-10)
-            view.renderer.add_event_handler(
-                self._on_pointer_up, "pointer_up", order=-10)
+            _add(self._on_pointer_down, "pointer_down")
+            _add(self._on_pointer_move, "pointer_move")
+            _add(self._on_pointer_up, "pointer_up")
         except Exception as e:
             print(f"SceneRendererManager: pointer handlers failed: {e}")
 
@@ -728,9 +735,15 @@ class CameraDisplayableManager(DisplayableManager):
         self._wheel_timer.timeout.connect(self._flush_wheel_push)
 
     def _add_node(self, node):
-        target_tag = f"vtkMRMLViewNode{self._layout_name}"
-        if node.GetActiveTag() != target_tag:
-            return None
+        # GetActiveTag() was deprecated in favour of GetLayoutName() in
+        # recent Slicer builds. GetLayoutName() returns the bare name
+        # ("1"), GetActiveTag() returns "vtkMRMLViewNode" + name.
+        if hasattr(node, "GetLayoutName"):
+            if node.GetLayoutName() != self._layout_name:
+                return None
+        else:
+            if node.GetActiveTag() != f"vtkMRMLViewNode{self._layout_name}":
+                return None
         self._tracked_node_id = node.GetID()
         self._apply_mrml_to_pygfx(node)
         return {"root": None, "camera_node": node}
@@ -740,13 +753,59 @@ class CameraDisplayableManager(DisplayableManager):
             return
         self._apply_mrml_to_pygfx(node)
 
+    # ----- FOV convention conversion -----
+    #
+    # VTK's vtkCamera.ViewAngle is the full VERTICAL field of view in
+    # degrees (when UseHorizontalViewAngle is off, which is Slicer's
+    # default). pygfx's PerspectiveCamera.fov is an aspect-averaged
+    # reference angle where (width + height) = 4*near*tan(fov/2) at
+    # the near plane: see pygfx._perspective._update_projection_matrix.
+    # For any aspect other than 1.0 these are not the same number, so
+    # copying VTK.ViewAngle straight into pygfx.fov makes the pygfx
+    # vertical FOV smaller than VTK's and the view looks flatter /
+    # further away. We bridge the two with these two helpers.
+
+    @staticmethod
+    def _vtk_vfov_to_pygfx_fov(vtk_fov_deg, aspect):
+        """Convert a VTK vertical FOV (deg) to the pygfx fov (deg) that
+        produces the same vertical FOV at the given widget aspect."""
+        import math
+        if aspect <= 0:
+            aspect = 1.0
+        half_vtk = math.radians(0.5 * float(vtk_fov_deg))
+        half_pyg = math.atan((1.0 + aspect) * 0.5 * math.tan(half_vtk))
+        return math.degrees(2.0 * half_pyg)
+
+    @staticmethod
+    def _pygfx_fov_to_vtk_vfov(pygfx_fov_deg, aspect):
+        """Inverse of the above."""
+        import math
+        if aspect <= 0:
+            aspect = 1.0
+        half_pyg = math.radians(0.5 * float(pygfx_fov_deg))
+        half_vtk = math.atan(2.0 * math.tan(half_pyg) / (1.0 + aspect))
+        return math.degrees(2.0 * half_vtk)
+
+    def _current_widget_aspect(self):
+        try:
+            w, h = self.view.widget.get_logical_size()
+        except Exception:
+            return 1.0
+        return (w / h) if h > 0 else 1.0
+
     def _apply_mrml_to_pygfx(self, cam_node):
         vtk_cam = cam_node.GetCamera()
         pos = vtk_cam.GetPosition()
         focal = vtk_cam.GetFocalPoint()
-        fov = float(vtk_cam.GetViewAngle())
+        vtk_vfov = float(vtk_cam.GetViewAngle())
         pygfx_cam = self.view.camera
-        pygfx_cam.fov = fov
+
+        # Keep pygfx's reference aspect locked to the widget's current
+        # aspect so `maintain_aspect` doesn't second-guess us, then pick
+        # a pygfx fov that maps to the requested VTK vertical FOV.
+        aspect = self._current_widget_aspect()
+        pygfx_cam.aspect = aspect
+        pygfx_cam.fov = self._vtk_vfov_to_pygfx_fov(vtk_vfov, aspect)
         pygfx_cam.local.position = tuple(pos)
         self._suppress_pygfx_push = True
         try:
@@ -786,16 +845,38 @@ class CameraDisplayableManager(DisplayableManager):
         else:
             target = tuple(float(x) for x in target)
         up = tuple(float(x) for x in pygfx_cam.local.up)
-        fov = float(pygfx_cam.fov)
+        # Convert pygfx's aspect-averaged fov back to a VTK vertical FOV
+        # so the side-by-side VTK pane renders at the same effective
+        # vertical angle.
+        aspect = pygfx_cam.aspect if pygfx_cam.aspect > 0 else \
+                 self._current_widget_aspect()
+        vtk_vfov = self._pygfx_fov_to_vtk_vfov(float(pygfx_cam.fov), aspect)
 
         vtk_cam = cam_node.GetCamera()
+        # vtkMRMLViewLinkLogic only broadcasts a camera modification to
+        # other views (honouring each view's LinkedControl flag) when
+        # the source camera reports Interacting == true AND non-zero
+        # InteractionFlags. Mirror the same pattern VTK's interactor
+        # uses during a real orbit so pygfx-originated pushes travel
+        # through Slicer's standard link propagation.
         self._suppress_mrml_event = True
+        was_modifying = cam_node.StartModify()
         try:
             vtk_cam.SetPosition(*pos)
             vtk_cam.SetFocalPoint(*target)
             vtk_cam.SetViewUp(*up)
-            vtk_cam.SetViewAngle(fov)
-            cam_node.Modified()
+            vtk_cam.SetViewAngle(vtk_vfov)
+            cam_node.SetInteractionFlags(
+                slicer.vtkMRMLCameraNode.CameraInteractionFlag)
+            cam_node.SetInteracting(1)
+            # EndModify fires one coalesced ModifiedEvent with the flags
+            # set, so ViewLinkLogic broadcasts iff the user has Link on.
+            cam_node.EndModify(was_modifying)
+            cam_node.SetInteracting(0)
+            # Tell the tracked view's displayable manager to recompute
+            # its auto-clipping range for the new camera pose. Same
+            # event Slicer's own interactor styles fire after a drag.
+            cam_node.ResetClippingRange()
         finally:
             self._suppress_mrml_event = False
 
@@ -1022,6 +1103,14 @@ class DualView:
         # Field-based renderer (volumes + fiducials + future) lives on a
         # single SceneRenderer driven by Displayers. Mesh-style nodes
         # (models, segmentations) keep their own scene-graph managers.
+        # CameraDisplayableManager tracks our own view node's camera
+        # (layoutName "1"). Each MRML view in a layout has its own
+        # camera -- Slicer's standard 3D-view Link button in the view
+        # controller is what users use to tie independent views
+        # together. _sync_camera_to_mrml() below initialises every
+        # camera to the same state at install time so the two panes
+        # start out visually identical; subsequent linking behaviour
+        # is up to Slicer's native link toggle.
         self.managers = [
             ViewDisplayableManager(self.view, layout_name="1"),
             ModelDisplayableManager(self.view),
@@ -1031,16 +1120,21 @@ class DualView:
         ]
 
         self.view.reset_camera()
-        # reset_camera() repositioned the pygfx camera (show_object on the
-        # scene) but didn't touch the MRML camera node. Without this push
-        # the right-side VTK view keeps its default camera orientation
-        # while the pygfx pane frames the scene -- the two panes look at
-        # the scene from different angles at install time.
+        # reset_camera() repositioned the pygfx camera (show_object on
+        # the scene). First push that state into the tracked MRML
+        # camera node (our own view), then copy the same state into
+        # every other camera node so all panes in the custom layout
+        # start out looking at the scene the same way.
         self._sync_camera_to_mrml()
+        self._initialize_all_cameras_to_match()
 
     def _sync_camera_to_mrml(self):
         """Push the current pygfx camera state into the tracked MRML
-        camera node so the paired VTK view mirrors our framing."""
+        camera node so the paired VTK view mirrors our framing. Only
+        the tracked camera (our own view node, layoutName '1') is
+        touched -- Slicer's other view nodes keep their own cameras
+        exactly as they were, and the user can toggle the standard 3D
+        view controller Link button to couple them."""
         cam_mgr = next(
             (m for m in self.managers if isinstance(m, CameraDisplayableManager)),
             None,
@@ -1051,6 +1145,63 @@ class DualView:
         if node is None:
             return
         cam_mgr._push_pygfx_to_mrml(node)
+
+    def _initialize_all_cameras_to_match(self):
+        """Copy the tracked camera's state into every other camera
+        node so all panes in the layout start from the same viewpoint.
+        One-shot install-time call. Skips any camera that is already
+        at the same position/focal/up/fov so we don't kick a redundant
+        VTK render when Slicer's link logic has already propagated."""
+        cam_mgr = next(
+            (m for m in self.managers if isinstance(m, CameraDisplayableManager)),
+            None,
+        )
+        if cam_mgr is None or cam_mgr._tracked_node_id is None:
+            return
+        tracked = slicer.mrmlScene.GetNodeByID(cam_mgr._tracked_node_id)
+        if tracked is None:
+            return
+        src = tracked.GetCamera()
+        pos = src.GetPosition()
+        focal = src.GetFocalPoint()
+        up = src.GetViewUp()
+        vfov = src.GetViewAngle()
+
+        def _eq_vec(a, b, tol=1e-6):
+            return all(abs(float(a[i]) - float(b[i])) <= tol for i in range(len(a)))
+
+        nodes = [n for n in slicer.util.getNodesByClass("vtkMRMLCameraNode")
+                 if n is not tracked]
+        for node in nodes:
+            dst = node.GetCamera()
+            if (_eq_vec(dst.GetPosition(), pos) and
+                    _eq_vec(dst.GetFocalPoint(), focal) and
+                    _eq_vec(dst.GetViewUp(), up) and
+                    abs(dst.GetViewAngle() - vfov) <= 1e-6):
+                continue  # already matches; no Modified, no extra render
+            was_modifying = node.StartModify()
+            try:
+                dst.SetPosition(*pos)
+                dst.SetFocalPoint(*focal)
+                dst.SetViewUp(*up)
+                dst.SetViewAngle(vfov)
+                # Explicit Modified inside the batch -- vtkCamera's
+                # SetXXX fires on the vtkCamera, but we also want the
+                # MRML node to report a change so downstream pipelines
+                # (clipping range, schedule render) run.
+                node.Modified()
+            finally:
+                node.EndModify(was_modifying)
+            # Jumping the camera a long way (default (0, 500, 0) ->
+            # volume-framed ~1.2m) leaves VTK's auto-clipping planes
+            # stuck on the old bounds, producing corrupted front/back
+            # clipping until the next user interaction recomputes
+            # them. vtkMRMLCameraDisplayableManager observes this event
+            # and calls renderer->ResetCameraClippingRange() for us.
+            node.ResetClippingRange()
+            # Let Qt/VTK flush the camera-modified + reset-clipping +
+            # schedule-render + actual-render chain before we move on.
+            slicer.app.processEvents()
 
     def _uninstall(self):
         for m in self.managers:

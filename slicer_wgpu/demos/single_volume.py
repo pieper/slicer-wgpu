@@ -454,7 +454,7 @@ class SlicerVolumeShader(BaseShader):
     def __init__(self, wobject):
         super().__init__(wobject)
 
-    def get_bindings(self, wobject, shared, scene):
+    def get_bindings(self, wobject, shared, scene=None):
         material = wobject.material
 
         bindings = [
