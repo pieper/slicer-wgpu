@@ -450,9 +450,24 @@ class SceneRendererManager:
         # assigned.
         self._initializing = True
         self._displayers = []
+        # Interactive-quality state. During a VolumePropertyNode
+        # Start/EndInteractionEvent bracket (i.e. while the user is
+        # dragging the Shift slider or poking the TF editor) we halve
+        # the renderer's pixel ratio and double each ImageField's
+        # sample step so the ray march has roughly 8x less work per
+        # frame. VTK's DM handles the same trade-off via
+        # DesiredUpdateRate on its mapper; doing it explicitly here
+        # keeps control predictable.
+        self._interaction_depth = 0
+        self._saved_pixel_ratio = None
+        self._saved_sample_steps: dict[int, float] = {}
+        self._interaction_pixel_ratio = 0.5
+        self._interaction_step_mult = 2.0
         self._displayers.append(VolumeRenderingDisplayer(
             on_structure_changed=self._on_structure_changed,
             on_field_modified=self._on_field_modified,
+            on_interaction_start=self._on_interaction_start,
+            on_interaction_end=self._on_interaction_end,
         ))
         self._displayers.append(FiducialDisplayer(
             on_structure_changed=self._on_structure_changed,
@@ -522,6 +537,64 @@ class SceneRendererManager:
                 f.fill_uniforms(self._renderer.material.uniform_buffer, s)
         self._renderer.material.uniform_buffer.update_full()
         self._renderer.recompute_scene_bounds()
+        self.view.request_redraw()
+
+    def _on_interaction_start(self):
+        """Drop quality for the duration of a drag. Nesting: multiple
+        overlapping Start events (e.g. two VolumePropertyNodes both
+        interactive at once) push the depth counter; only the first
+        actually changes settings, and only the last End restores them."""
+        self._interaction_depth += 1
+        if self._interaction_depth > 1 or self._renderer is None:
+            return
+        self._apply_interaction_settings(
+            pixel_ratio=self._interaction_pixel_ratio,
+            step_mult=self._interaction_step_mult,
+        )
+
+    def _on_interaction_end(self):
+        self._interaction_depth = max(0, self._interaction_depth - 1)
+        if self._interaction_depth > 0 or self._renderer is None:
+            return
+        self._apply_interaction_settings(
+            pixel_ratio=self._saved_pixel_ratio,
+            step_mult=None,  # restore from saved baseline
+        )
+        self._saved_pixel_ratio = None
+
+    def _apply_interaction_settings(self, pixel_ratio, step_mult):
+        """Push the pixel ratio and per-field sample_step_mm through to
+        the material buffer + GPU in a single pass. step_mult=None means
+        restore each field's saved baseline; a float means
+        new_step = saved * step_mult (and stash saved if not yet)."""
+        try:
+            # pygfx's WgpuRenderer.pixel_ratio is a settable property;
+            # None means "follow the canvas's own ratio".
+            if step_mult is not None and self._saved_pixel_ratio is None:
+                self._saved_pixel_ratio = self.view.renderer.pixel_ratio
+            self.view.renderer.pixel_ratio = pixel_ratio
+        except Exception as e:
+            print(f"SceneRendererManager pixel_ratio change: {e}")
+
+        for f in self._renderer.fields():
+            if not hasattr(f, "sample_step_mm"):
+                continue
+            if step_mult is not None:
+                if id(f) not in self._saved_sample_steps:
+                    self._saved_sample_steps[id(f)] = f.sample_step_mm
+                f.sample_step_mm = self._saved_sample_steps[id(f)] * step_mult
+            else:
+                base = self._saved_sample_steps.pop(id(f), None)
+                if base is not None:
+                    f.sample_step_mm = base
+
+        # recompute_scene_bounds() writes the new min(sample_step) into
+        # the material uniform buffer; update_full() pushes it to the
+        # GPU. Without the explicit upload the sample_step change would
+        # sit in CPU memory and the shader would keep using the stale
+        # value (same latent gap as _on_field_modified's ordering).
+        self._renderer.recompute_scene_bounds()
+        self._renderer.material.uniform_buffer.update_full()
         self.view.request_redraw()
 
     def _rebuild_renderer(self):

@@ -43,11 +43,20 @@ class VolumeRenderingDisplayer(Displayer):
             # IgnoreVolumePropertyChanges=true, so vtkMRMLVolumePropertyNode
             # does NOT re-fire ModifiedEvent during the drag; it fires
             # InteractionEvent instead (per ProcessMRMLEvents). Observe
-            # those as well so our LUT stays in sync — matching what the
-            # VTK vtkMRMLVolumeRenderingDisplayableManager does.
-            for ev in (vtk.vtkCommand.InteractionEvent,
-                       vtk.vtkCommand.EndInteractionEvent):
-                tags.append((vp, vp.AddObserver(ev, self._handle_node_modified)))
+            # InteractionEvent so our LUT stays in sync during the drag,
+            # matching what the VTK DM does.
+            tags.append((vp, vp.AddObserver(
+                vtk.vtkCommand.InteractionEvent, self._handle_node_modified)))
+            # Start/End Interaction bracket the drag. Forward them to
+            # the host so the renderer can trade quality for frame rate
+            # while the slider is moving and restore full quality when
+            # the user lets go.
+            tags.append((vp, vp.AddObserver(
+                vtk.vtkCommand.StartInteractionEvent,
+                lambda c, e: self._on_interaction_start())))
+            tags.append((vp, vp.AddObserver(
+                vtk.vtkCommand.EndInteractionEvent,
+                self._handle_end_interaction)))
         # vtkMRMLTransformableNode relays a TransformModifiedEvent on
         # the volume itself whenever any ancestor in its transform
         # chain changes (either a re-parent or a matrix mutation),
@@ -57,6 +66,25 @@ class VolumeRenderingDisplayer(Displayer):
             tags.append((vol, vol.AddObserver(
                 slicer.vtkMRMLTransformableNode.TransformModifiedEvent,
                 self._handle_transform_modified)))
+
+    def _handle_end_interaction(self, caller, event) -> None:
+        # On release: refresh the Field at full quality, THEN tell the
+        # host to restore pixel ratio / sample step. The TF fast path
+        # is cheap (LUT-only), so re-running it here guarantees the
+        # final still-frame reflects the last interaction state before
+        # quality comes back up.
+        nid = self._caller_to_nid.get(id(caller))
+        if nid is not None:
+            node = self.mrml_scene.GetNodeByID(nid)
+            field = self.fields_by_nid.get(nid)
+            if node is not None and field is not None:
+                try:
+                    self._update_field(node, field)
+                    self._on_field_modified(field)
+                except Exception as e:
+                    print(f"VolumeRenderingDisplayer end-interaction "
+                          f"refresh failed: {e}")
+        self._on_interaction_end()
 
     def _handle_transform_modified(self, caller, event) -> None:
         """Fast path: only the transform changed, so update

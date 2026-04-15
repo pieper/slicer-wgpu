@@ -37,7 +37,9 @@ class Displayer:
 
     def __init__(self, mrml_scene=None,
                  on_structure_changed: Callable[[], None] | None = None,
-                 on_field_modified: Callable[[Field], None] | None = None):
+                 on_field_modified: Callable[[Field], None] | None = None,
+                 on_interaction_start: Callable[[], None] | None = None,
+                 on_interaction_end: Callable[[], None] | None = None):
         self.mrml_scene = mrml_scene if mrml_scene is not None else slicer.mrmlScene
         # nid -> Field
         self.fields_by_nid: dict[str, Field] = {}
@@ -49,6 +51,12 @@ class Displayer:
 
         self._on_structure_changed = on_structure_changed or (lambda: None)
         self._on_field_modified = on_field_modified or (lambda f: None)
+        # Optional: host-level "user is actively dragging" hooks so the
+        # renderer can drop pixel ratio / raise sample step mid-drag and
+        # restore at rest. Modelled after VTK's DesiredUpdateRate path
+        # but kept explicit instead of auto-tuned.
+        self._on_interaction_start = on_interaction_start or (lambda: None)
+        self._on_interaction_end = on_interaction_end or (lambda: None)
 
         self_ref = weakref.ref(self)
 
