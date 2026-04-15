@@ -355,6 +355,49 @@ fn tf_field_img{i}(s: FieldSample) -> vec4<f32> {{
 }}
 """
 
+    # -------- TF fast path --------
+
+    def refresh_from_display_node(self, volume_node, vr_display_node) -> None:
+        """Re-read the colour / opacity / gradient-opacity TFs and
+        shading parameters from the MRML display node and rewrite the
+        two 1D LUT textures in place. Keeps the expensive 3D
+        `_volume_tex` and the same ImageField instance, so live TF
+        edits (Shift slider, preset swap, per-frame threshold sweeps)
+        cost O(lut size) rather than O(voxels).
+
+        Called by VolumeRenderingDisplayer's ModifiedEvent /
+        InteractionEvent handler on the VolumePropertyNode.
+        """
+        import slicer
+        vp = vr_display_node.GetVolumePropertyNode().GetVolumeProperty()
+        arr = slicer.util.arrayFromVolume(volume_node)
+        dmin, dmax = float(arr.min()), float(arr.max())
+        tf_lo, tf_hi = vp.GetScalarOpacity().GetRange()
+        smin = max(float(tf_lo), dmin)
+        smax = min(float(tf_hi), dmax)
+        if smax <= smin:
+            smin, smax = dmin, dmax
+
+        lut = _build_lut_array(vr_display_node, 256, (smin, smax))
+        grad_lut, grad_range = _build_gradient_opacity_lut_array(
+            vr_display_node)
+
+        if self._lut_tex is not None:
+            self._lut_tex.set_data(lut.astype(np.float32, copy=False))
+        if self._grad_lut_tex is not None:
+            self._grad_lut_tex.set_data(grad_lut.astype(np.float32, copy=False))
+
+        self.clim = (smin, smax)
+        self.gradient_range = grad_range
+        self.opacity_unit_distance = float(vp.GetScalarOpacityUnitDistance())
+        if vp.GetShade():
+            self.k_ambient = float(vp.GetAmbient())
+            self.k_diffuse = float(vp.GetDiffuse())
+            self.k_specular = float(vp.GetSpecular())
+            self.shininess = float(vp.GetSpecularPower())
+        self.visible = (vr_display_node.GetVisibility() == 1)
+        self.touch()
+
     # -------- Transform API --------
 
     def set_world_from_local(self, world_from_local: np.ndarray) -> None:

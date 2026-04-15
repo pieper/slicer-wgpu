@@ -89,9 +89,26 @@ class VolumeRenderingDisplayer(Displayer):
             return None
 
     def _update_field(self, node, field) -> bool:
-        # Any TF / property change rebuilds the LUT; cleanest is to drop
-        # the field and let _make_field rebuild it on next add. That
-        # counts as a structural change so the SceneRenderer can decide.
+        # Fast path: a VolumePropertyNode Modified/InteractionEvent means
+        # the TF (scalar opacity, colour, gradient opacity, shading
+        # params) changed but the 3D volume data did not. Rewrite the
+        # 1D LUT textures and scalar uniforms in place on the same
+        # ImageField instance -- O(lut size), not O(voxels) -- and
+        # return False so the SceneRenderer just re-fills uniforms and
+        # redraws rather than reinstantiating the whole Field (which
+        # would re-upload the volume texture every Shift-slider tick).
+        vol_node = node.GetVolumeNode()
+        if vol_node is not None:
+            try:
+                field.refresh_from_display_node(vol_node, node)
+                return False
+            except Exception as e:
+                print(f"VolumeRenderingDisplayer TF fast path failed, "
+                      f"falling back to full rebuild: {e}")
+
+        # Fallback: full rebuild. Happens when refresh raised (e.g.
+        # stale pygfx texture reference after an install teardown) or
+        # the volume node disappeared.
         nid = node.GetID()
         del self.fields_by_nid[nid]
         new_field = self._make_field(node)
