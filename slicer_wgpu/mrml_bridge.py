@@ -114,6 +114,15 @@ class PygfxView:
             self.widget.draw_frame = None
         except Exception:
             pass
+        # Unregister the canvas from rendercanvas's internal loop list
+        # BEFORE Qt gets around to deleting the underlying QWidget. Skip
+        # this and the loop's scheduler keeps a stale QRenderWidget
+        # reference that crashes on the next SIGINT with "Trying to call
+        # 'parent' on a destroyed QWidget".
+        try:
+            self.widget.close()
+        except Exception:
+            pass
 
     def reset_camera(self):
         has_content = any(
@@ -1190,6 +1199,21 @@ class DualView:
         slicer.app.processEvents()
 
         self.view = PygfxView()
+        # Constructing the first PygfxView spins up rendercanvas's Qt
+        # loop, which installs its own SIGINT handler over Python's
+        # default_int_handler (see rendercanvas/core/loop.py:
+        # __setup_interrupt_hooks). The handler calls loop.stop() ->
+        # canvas.close() on every registered canvas, which later
+        # crashes with "Trying to call 'parent' on a destroyed
+        # QWidget" and, more importantly, prevents Slicer from exiting
+        # on Ctrl-C. Restore the standard Python handler so SIGINT
+        # bubbles up to the normal KeyboardInterrupt path and Qt's
+        # event loop can shut down cleanly.
+        try:
+            import signal
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except Exception as e:
+            print(f"SIGINT restore failed (non-fatal): {e}")
         self._inject_widget()
 
         configure_slicer_controls(self.view.controller)
