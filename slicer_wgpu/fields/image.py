@@ -110,12 +110,25 @@ class ImageField(Field):
         visible: bool = True,
         interpolation: str = "linear",
         world_from_local: np.ndarray | None = None,
+        data_range: tuple[float, float] | None = None,
     ):
         super().__init__()
         self._volume_tex = (
             pygfx.Texture(volume_array.astype(np.float32, copy=False), dim=3)
             if volume_array is not None else None
         )
+        # Cached min/max of the source volume. Used by the TF fast path
+        # to clamp the TF range against actual data without re-scanning
+        # the voxels on every Shift-slider tick (the scan was the
+        # previous fast path's bottleneck -- a hundreds-of-MB
+        # numpy.min()/max() every event is not interactive).
+        if data_range is None and volume_array is not None:
+            self._data_range = (float(volume_array.min()),
+                                float(volume_array.max()))
+        elif data_range is not None:
+            self._data_range = (float(data_range[0]), float(data_range[1]))
+        else:
+            self._data_range = (0.0, 1.0)
         self._lut_tex = (
             pygfx.Texture(lut_array.astype(np.float32, copy=False), dim=1)
             if lut_array is not None else None
@@ -212,6 +225,7 @@ class ImageField(Field):
             gradient_opacity_enabled=(vr_display_node is not None),
             k_ambient=ka, k_diffuse=kd, k_specular=ks, shininess=sh,
             visible=visible,
+            data_range=(dmin, dmax),
         )
 
     # -------- Field protocol --------
@@ -368,10 +382,11 @@ fn tf_field_img{i}(s: FieldSample) -> vec4<f32> {{
         Called by VolumeRenderingDisplayer's ModifiedEvent /
         InteractionEvent handler on the VolumePropertyNode.
         """
-        import slicer
         vp = vr_display_node.GetVolumePropertyNode().GetVolumeProperty()
-        arr = slicer.util.arrayFromVolume(volume_node)
-        dmin, dmax = float(arr.min()), float(arr.max())
+        # Use the cached scalar range -- see __init__ for why. volume_node
+        # is accepted for signature symmetry and for future callers that
+        # may want to override the cache (e.g. after ImageDataModified).
+        dmin, dmax = self._data_range
         tf_lo, tf_hi = vp.GetScalarOpacity().GetRange()
         smin = max(float(tf_lo), dmin)
         smax = min(float(tf_hi), dmax)
