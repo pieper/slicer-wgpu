@@ -27,6 +27,12 @@ import slicer
 import vtk
 import vtk.util.numpy_support as vnp
 import qt
+# Force PythonQt into sys.modules BEFORE importing rendercanvas.qt.
+# The pieper/rendercanvas PythonQt fork uses `"PythonQt" in sys.modules`
+# to pick its backend; Slicer's `import qt` shim wraps PythonQt but
+# doesn't reliably put the PythonQt top-level name into sys.modules
+# (depending on build), so we import it explicitly.
+import PythonQt  # noqa: F401
 import pygfx
 import pylinalg as la
 from rendercanvas.qt import QRenderWidget
