@@ -93,13 +93,17 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
     let ndc_x = (varyings.position.x / size.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - (varyings.position.y / size.y) * 2.0;
 
-    let cs = sign(
-        u_stdinfo.cam_transform[0][0] *
-        u_stdinfo.cam_transform[1][1] *
-        u_stdinfo.cam_transform[2][2]
-    );
-    let world_near = ndc_to_world_pos(vec4<f32>(ndc_x, ndc_y, -cs, 1.0));
-    let world_far  = ndc_to_world_pos(vec4<f32>(ndc_x, ndc_y,  cs, 1.0));
+    // WebGPU NDC z is [0, 1] with z=0 at the near plane. pygfx's
+    // ndc_to_world_pos applies inv(projection)*inv(view) directly so
+    // it respects whatever projection matrix the camera wrote. The
+    // `sign(cam_transform_diag_product)` hack (copied from pygfx's
+    // volume_ray.wgsl) only holds for axis-aligned cameras -- for
+    // off-axis rotations the view-matrix diagonals are small and
+    // mixed-sign, so the product flips sign spuriously and the ray
+    // inverts, giving back-to-front compositing (spine appears in
+    // front of ribs).
+    let world_near = ndc_to_world_pos(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
+    let world_far  = ndc_to_world_pos(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0));
     let ray_origin = world_near;
     let ray_dir    = normalize(world_far - world_near);
 
