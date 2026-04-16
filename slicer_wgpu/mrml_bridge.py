@@ -334,6 +334,12 @@ class PygfxView:
         # a full synchronous ray-march and Qt input would stall.
         self._redraw_pending = False
 
+        # Pre-render callbacks fire inside _animate() just before
+        # renderer.render(). Managers use this to synchronise state that
+        # depends on the camera pose (e.g. camera-relative light
+        # directions for cinematic rendering) before the frame is drawn.
+        self._before_render_callbacks = []
+
         try:
             self.renderer.add_event_handler(self._on_controller_event, "pointer_move", "wheel")
         except Exception:
@@ -354,10 +360,25 @@ class PygfxView:
     def _animate(self):
         if self._closed:
             return
+        for cb in list(self._before_render_callbacks):
+            try:
+                cb()
+            except Exception as e:
+                print(f"PygfxView before-render callback error: {e}")
         try:
             self.renderer.render(self.scene, self.camera)
         except Exception as e:
             print(f"PygfxView._animate render error: {e}")
+
+    def add_before_render_callback(self, cb):
+        if cb not in self._before_render_callbacks:
+            self._before_render_callbacks.append(cb)
+
+    def remove_before_render_callback(self, cb):
+        try:
+            self._before_render_callbacks.remove(cb)
+        except ValueError:
+            pass
 
     def request_redraw(self):
         """Request a redraw at the next idle moment, coalescing bursts
@@ -746,6 +767,17 @@ class SceneRendererManager:
         self._fill_light_direction = (0.0, 0.0, 0.0)
         self._fill_light_intensity = 0.0
         self._shadow_resolution = 256
+        # Camera-relative light state. When camera_relative is True the
+        # directions above are recomputed every frame by rotating the
+        # *_camera_space vectors with the camera's current basis, so
+        # shadows track the camera during orbits.
+        self._camera_relative = False
+        self._key_camera_space = (0.0, 0.0, 0.0)
+        self._fill_camera_space = (0.0, 0.0, 0.0)
+        # Remembers the last camera rotation we built shadows against,
+        # so we only re-dispatch the compute pass when the camera has
+        # actually moved.
+        self._last_cam_rot_sig = None
         # Suppress structure-change callbacks while we populate the
         # displayer list: each Displayer's __init__ scans the scene and
         # would call back into _rebuild_renderer before _displayers is
@@ -800,11 +832,19 @@ class SceneRendererManager:
         except Exception as e:
             print(f"SceneRendererManager: pointer handlers failed: {e}")
 
+        # Register the camera-relative-lights pre-render callback; it's
+        # a no-op when shadows + camera_relative are off.
+        self.view.add_before_render_callback(self._before_render)
+
         # Initial scan already populated displayers with whatever was in
         # the scene at construction time; build the renderer now.
         self._rebuild_renderer()
 
     def cleanup(self):
+        try:
+            self.view.remove_before_render_callback(self._before_render)
+        except Exception:
+            pass
         for d in self._displayers:
             try:
                 d.cleanup()
@@ -975,39 +1015,61 @@ class SceneRendererManager:
     def enable_shadows(self, light_direction, resolution: int = 256,
                        light_intensity: float = 1.0,
                        fill_light_direction=None,
-                       fill_light_intensity: float = 0.0):
+                       fill_light_intensity: float = 0.0,
+                       camera_relative: bool = False):
         """Turn on soft volumetric shadows cast by ImageFields.
 
-        ``light_direction`` is a world-space vector pointing FROM the
-        surface TO the light (the same vector you'd use in an NdotL
-        term). A zero vector disables the directional light and restores
+        ``light_direction`` is a vector pointing FROM the surface TO the
+        light. A zero vector disables the directional light and restores
         the per-pixel headlight fallback.
 
         ``light_intensity`` scales the key-light (shadowed) direct term.
         ``fill_light_direction`` / ``fill_light_intensity`` configure an
-        optional unshadowed fill light (direction pointing from surface
-        toward the fill source). Pass ``fill_light_direction=None`` or
-        ``fill_light_intensity=0`` to disable the fill.
+        optional unshadowed fill light. Pass ``fill_light_direction=None``
+        or ``fill_light_intensity=0`` to disable the fill.
+
+        When ``camera_relative`` is ``True`` the passed directions are
+        interpreted in CAMERA space (pygfx convention: +X right, +Y up,
+        -Z forward) and the manager updates the world-space uniforms +
+        rebuilds the shadow volume before every frame, so the lights
+        follow the camera as it orbits. Otherwise directions are taken
+        as world-space and updated only when explicitly set.
         """
         self._shadows_enabled = True
-        self._light_direction = tuple(float(x) for x in light_direction)
+        self._camera_relative = bool(camera_relative)
+        self._shadow_resolution = int(resolution)
         self._light_intensity = float(light_intensity)
         if fill_light_direction is None:
-            self._fill_light_direction = (0.0, 0.0, 0.0)
-            self._fill_light_intensity = 0.0
+            fill_dir = (0.0, 0.0, 0.0)
+            fill_int = 0.0
         else:
-            self._fill_light_direction = tuple(float(x) for x in fill_light_direction)
-            self._fill_light_intensity = float(fill_light_intensity)
-        self._shadow_resolution = int(resolution)
+            fill_dir = tuple(float(x) for x in fill_light_direction)
+            fill_int = float(fill_light_intensity)
+        self._fill_light_intensity = fill_int
+        if self._camera_relative:
+            self._key_camera_space = tuple(float(x) for x in light_direction)
+            self._fill_camera_space = fill_dir
+            # World directions are populated by _update_camera_relative_lights
+            # before the next render; seed with something non-degenerate.
+            self._light_direction = (0.0, 0.0, 1.0)
+            self._fill_light_direction = (1.0, 0.0, 0.0)
+        else:
+            self._light_direction = tuple(float(x) for x in light_direction)
+            self._fill_light_direction = fill_dir
+            self._key_camera_space = (0.0, 0.0, 0.0)
+            self._fill_camera_space = (0.0, 0.0, 0.0)
         self._rebuild_renderer()
 
     def disable_shadows(self):
         """Return to plain headlight rendering with no shadow compute."""
         self._shadows_enabled = False
+        self._camera_relative = False
         self._light_direction = (0.0, 0.0, 0.0)
         self._light_intensity = 1.0
         self._fill_light_direction = (0.0, 0.0, 0.0)
         self._fill_light_intensity = 0.0
+        self._key_camera_space = (0.0, 0.0, 0.0)
+        self._fill_camera_space = (0.0, 0.0, 0.0)
         self._rebuild_renderer()
 
     def set_light_direction(self, light_direction):
@@ -1041,6 +1103,38 @@ class SceneRendererManager:
             self._renderer.material.fill_light_direction = self._fill_light_direction
             self._renderer.material.fill_light_intensity = self._fill_light_intensity
             self.view.request_redraw()
+
+    def _before_render(self):
+        """PygfxView pre-render callback: keep camera-relative lights in
+        sync with the current camera basis, and rebuild the shadow
+        texture when the camera rotated since the last build. No-op when
+        shadows or camera-relative mode are off."""
+        if not (self._shadows_enabled and self._camera_relative):
+            return
+        if self._renderer is None:
+            return
+
+        import numpy as _np
+        cam = self.view.camera
+        R = _np.asarray(cam.world.matrix, dtype=_np.float64)[:3, :3]
+        key_cam = _np.asarray(self._key_camera_space, dtype=_np.float64)
+        fill_cam = _np.asarray(self._fill_camera_space, dtype=_np.float64)
+        key_world = tuple(float(x) for x in (R @ key_cam))
+        fill_world = tuple(float(x) for x in (R @ fill_cam))
+
+        self._light_direction = key_world
+        self._fill_light_direction = fill_world
+        mat = self._renderer.material
+        mat.light_direction = key_world
+        mat.fill_light_direction = fill_world
+
+        # Rebuild shadow volume only when the camera's rotation changed
+        # enough to matter; a rounded signature catches "really static"
+        # frames without per-orbit-pixel rebuild thrashing.
+        sig = tuple(round(float(v), 5) for v in R.ravel())
+        if sig != self._last_cam_rot_sig:
+            self._last_cam_rot_sig = sig
+            self._refresh_shadow_volume()
 
     def _refresh_shadow_volume(self):
         """Re-dispatch the shadow compute pass using the renderer's
