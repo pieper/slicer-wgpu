@@ -114,22 +114,38 @@ class _VtkStyleOrbitController(pygfx.OrbitController):
 
 class _ScreenQRenderWidget(QRenderWidget):
     """QRenderWidget that prefers wgpu's 'screen' present method over
-    rendercanvas's default 'bitmap'. Screen-present lets wgpu draw
-    directly into a CAMetalLayer / HWND / X11 window surface owned by
-    this widget, skipping the per-frame GPU->CPU readback + QImage
-    blit that bitmap-present does (~1.4 MB transfer per frame for a
-    typical view).
+    rendercanvas's default 'bitmap' on platforms where we've verified
+    it works. Screen-present lets wgpu draw directly into a
+    CAMetalLayer / HWND / X11 surface owned by this widget, skipping
+    the per-frame GPU->CPU readback + QImage blit that bitmap-present
+    does (~1.4 MB transfer per frame for a typical view).
 
     rendercanvas defaults to bitmap to sidestep Qt compositor issues
     it has encountered across platforms (see rendercanvas/qt.py
-    _rc_get_present_info for the rationale). For our Slicer integration
-    we accept that risk in exchange for the performance -- if screen-
-    present doesn't work on a given build we can flip back to bitmap
-    by instantiating QRenderWidget instead.
+    _rc_get_present_info for the rationale). We opt in only where
+    we've tested the screen path doesn't trip wgpu's surface
+    validation:
+
+      * darwin (macOS / Metal): verified
+      * win32 (Windows / DXGI): expected to work (well-supported
+        wgpu target), enabled
+      * linux: DISABLED by default -- wgpu's X11 surface config path
+        panics on some Qt builds ("Error in wgpuSurfaceConfigure:
+        Validation Error", Rust panic, unrecoverable from Python).
+        Falls back to bitmap until the specific surface
+        configuration mismatch is resolved.
+
+    Override _SCREEN_ENABLED_PLATFORMS to override the default set per
+    deployment.
     """
 
+    import sys as _sys
+    _SCREEN_ENABLED_PLATFORMS = frozenset(("darwin", "win32"))
+
     def _rc_get_present_info(self, present_methods):
-        if "screen" in present_methods:
+        import sys
+        if (sys.platform in self._SCREEN_ENABLED_PLATFORMS
+                and "screen" in present_methods):
             surface_ids = self._get_surface_ids()
             if surface_ids:
                 # WA_PaintOnScreen implies WA_NativeWindow; Qt stops
@@ -137,7 +153,8 @@ class _ScreenQRenderWidget(QRenderWidget):
                 # pixels.
                 self.setAttribute(WA_PaintOnScreen, True)
                 return {"method": "screen", **surface_ids}
-        # Fall back to whatever rendercanvas would have picked.
+        # Fall back to whatever rendercanvas would have picked
+        # (= bitmap on Qt).
         return super()._rc_get_present_info(present_methods)
 
 
