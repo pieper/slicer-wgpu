@@ -235,6 +235,12 @@ class SceneMaterial(pygfx.Material):
         self.scene_bounds_max = (100.0, 100.0, 100.0)
         # Zero means "use per-pixel headlight" in the fragment shader.
         self.light_direction = (0.0, 0.0, 0.0, 0.0)
+        self.light_intensity = 1.0
+        # Fill light: unshadowed, off by default. xyz points FROM surface
+        # TO the fill light source. When fill_light_intensity is 0 or the
+        # direction is a zero vector, the fill contribution is skipped.
+        self.fill_light_direction = (0.0, 0.0, 0.0, 0.0)
+        self.fill_light_intensity = 0.0
         self.sample_step = 1.0
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -282,6 +288,28 @@ class SceneMaterial(pygfx.Material):
     @light_direction.setter
     def light_direction(self, v): self._set_vec4("light_direction", v)
 
+    @property
+    def light_intensity(self):
+        return float(self.uniform_buffer.data["light_intensity"])
+    @light_intensity.setter
+    def light_intensity(self, v):
+        self.uniform_buffer.data["light_intensity"] = float(v)
+        self.uniform_buffer.update_full()
+
+    @property
+    def fill_light_direction(self):
+        return tuple(float(x) for x in self.uniform_buffer.data["fill_light_direction"][:3])
+    @fill_light_direction.setter
+    def fill_light_direction(self, v): self._set_vec4("fill_light_direction", v)
+
+    @property
+    def fill_light_intensity(self):
+        return float(self.uniform_buffer.data["fill_light_intensity"])
+    @fill_light_intensity.setter
+    def fill_light_intensity(self, v):
+        self.uniform_buffer.data["fill_light_intensity"] = float(v)
+        self.uniform_buffer.update_full()
+
 
 def make_material_class(fields: list[Field], slot_indices: list[int]):
     """Dynamically build a SceneMaterial subclass with the right per-field
@@ -304,8 +332,13 @@ def make_material_class(fields: list[Field], slot_indices: list[int]):
     # as the shadow compute pass). When its length is <1e-6, the fragment
     # shader falls back to a per-pixel headlight, preserving the
     # unshaded-default look for callers that haven't opted into shadows.
-    uniform_type["light_direction"]   = "4xf4"
-    uniform_type["sample_step"]       = "f4"
+    uniform_type["light_direction"]       = "4xf4"
+    # Optional fill light (unshadowed, intensity-scaled). xyz is the
+    # surface-to-light direction; intensity==0 disables the fill term.
+    uniform_type["fill_light_direction"]  = "4xf4"
+    uniform_type["light_intensity"]       = "f4"
+    uniform_type["fill_light_intensity"]  = "f4"
+    uniform_type["sample_step"]           = "f4"
 
     # Per-field uniforms
     for field, slot in zip(fields, slot_indices):

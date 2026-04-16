@@ -336,30 +336,50 @@ fn sample_field_img{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
     opacity = clamp(opacity, 0.0, 1.0);
     if (opacity <= 0.001) {{ return out; }}
 
-    // Phong in sRGB (the TF is authored in sRGB).
+    // Phong in sRGB (the TF is authored in sRGB). Ambient is always
+    // present; key (shadowed) and fill (unshadowed) direct terms are
+    // added on top when the surface faces each light.
     var lit = tf.rgb * u_material.img{i}_k_ambient;
     if (grad_len > 1e-6) {{
         var n = grad / grad_len;
         if (dot(n, -ray_dir) < 0.0) {{ n = -n; }}
         let view_dir = normalize(ray_origin - wp);
+
+        // ---- Key light (shadow-casting) -----------------------------
         // u_material.light_direction points FROM surface TO light.
-        // Zero-vector means "no directional light set" and we fall back
-        // to the per-pixel headlight used before enable_shadows existed.
-        var to_light = u_material.light_direction.xyz;
-        let ld_len = length(to_light);
-        if (ld_len < 1e-6) {{
-            to_light = view_dir;
+        // Zero-vector falls back to a per-pixel headlight so callers
+        // who never opted into directional lighting see unchanged output.
+        var to_key = u_material.light_direction.xyz;
+        let key_len = length(to_key);
+        if (key_len < 1e-6) {{
+            to_key = view_dir;
         }} else {{
-            to_light = to_light / ld_len;
+            to_key = to_key / key_len;
         }}
-        let ldotn = dot(to_light, n);
-        if (ldotn > 0.0) {{
-            let refl = normalize(2.0 * ldotn * n - to_light);
-            let rdotv = max(0.0, dot(refl, view_dir));
+        let ldotn_k = dot(to_key, n);
+        if (ldotn_k > 0.0) {{
+            let refl_k = normalize(2.0 * ldotn_k * n - to_key);
+            let rdotv_k = max(0.0, dot(refl_k, view_dir));
             let shadow = sample_shadow(wp);
-            let direct = tf.rgb * u_material.img{i}_k_diffuse * ldotn
-                       + vec3<f32>(u_material.img{i}_k_specular * pow(rdotv, u_material.img{i}_shininess));
-            lit = tf.rgb * u_material.img{i}_k_ambient + direct * shadow;
+            let direct_k = tf.rgb * u_material.img{i}_k_diffuse * ldotn_k
+                         + vec3<f32>(u_material.img{i}_k_specular * pow(rdotv_k, u_material.img{i}_shininess));
+            lit = lit + direct_k * shadow * u_material.light_intensity;
+        }}
+
+        // ---- Fill light (unshadowed, intensity-scaled) --------------
+        let fi = u_material.fill_light_intensity;
+        var to_fill = u_material.fill_light_direction.xyz;
+        let fill_len = length(to_fill);
+        if (fi > 0.0 && fill_len > 1e-6) {{
+            to_fill = to_fill / fill_len;
+            let ldotn_f = dot(to_fill, n);
+            if (ldotn_f > 0.0) {{
+                let refl_f = normalize(2.0 * ldotn_f * n - to_fill);
+                let rdotv_f = max(0.0, dot(refl_f, view_dir));
+                let direct_f = tf.rgb * u_material.img{i}_k_diffuse * ldotn_f
+                             + vec3<f32>(u_material.img{i}_k_specular * pow(rdotv_f, u_material.img{i}_shininess));
+                lit = lit + direct_f * fi;
+            }}
         }}
     }}
     out.hit = true;

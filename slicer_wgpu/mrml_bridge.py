@@ -741,6 +741,10 @@ class SceneRendererManager:
         # aren't affected; call enable_shadows(light_direction) to opt in.
         self._shadows_enabled = False
         self._light_direction = (0.0, 0.0, 0.0)
+        self._light_intensity = 1.0
+        # Fill light: unshadowed, off by default. Set via set_fill_light().
+        self._fill_light_direction = (0.0, 0.0, 0.0)
+        self._fill_light_intensity = 0.0
         self._shadow_resolution = 256
         # Suppress structure-change callbacks while we populate the
         # displayer list: each Displayer's __init__ scans the scene and
@@ -948,13 +952,16 @@ class SceneRendererManager:
             print(f"SceneRendererManager: build_for_fields failed: {e}")
             return
 
-        # Push current light direction into the scene material uniform,
-        # regardless of whether shadows are on -- a zero vector keeps
-        # the fragment shader's per-pixel headlight fallback.
+        # Push current light state into the scene material uniforms.
+        # Zero key-direction keeps the fragment shader's per-pixel
+        # headlight fallback; zero fill-intensity skips the fill term.
         try:
             self._renderer.material.light_direction = self._light_direction
+            self._renderer.material.light_intensity = self._light_intensity
+            self._renderer.material.fill_light_direction = self._fill_light_direction
+            self._renderer.material.fill_light_intensity = self._fill_light_intensity
         except Exception as e:
-            print(f"SceneRendererManager: light_direction set failed: {e}")
+            print(f"SceneRendererManager: light uniform set failed: {e}")
 
         # Populate the shadow texture immediately.
         if shadow_volume is not None:
@@ -965,16 +972,32 @@ class SceneRendererManager:
 
     # ----- Shadows -----
 
-    def enable_shadows(self, light_direction, resolution: int = 256):
+    def enable_shadows(self, light_direction, resolution: int = 256,
+                       light_intensity: float = 1.0,
+                       fill_light_direction=None,
+                       fill_light_intensity: float = 0.0):
         """Turn on soft volumetric shadows cast by ImageFields.
 
         ``light_direction`` is a world-space vector pointing FROM the
         surface TO the light (the same vector you'd use in an NdotL
         term). A zero vector disables the directional light and restores
         the per-pixel headlight fallback.
+
+        ``light_intensity`` scales the key-light (shadowed) direct term.
+        ``fill_light_direction`` / ``fill_light_intensity`` configure an
+        optional unshadowed fill light (direction pointing from surface
+        toward the fill source). Pass ``fill_light_direction=None`` or
+        ``fill_light_intensity=0`` to disable the fill.
         """
         self._shadows_enabled = True
         self._light_direction = tuple(float(x) for x in light_direction)
+        self._light_intensity = float(light_intensity)
+        if fill_light_direction is None:
+            self._fill_light_direction = (0.0, 0.0, 0.0)
+            self._fill_light_intensity = 0.0
+        else:
+            self._fill_light_direction = tuple(float(x) for x in fill_light_direction)
+            self._fill_light_intensity = float(fill_light_intensity)
         self._shadow_resolution = int(resolution)
         self._rebuild_renderer()
 
@@ -982,18 +1005,41 @@ class SceneRendererManager:
         """Return to plain headlight rendering with no shadow compute."""
         self._shadows_enabled = False
         self._light_direction = (0.0, 0.0, 0.0)
+        self._light_intensity = 1.0
+        self._fill_light_direction = (0.0, 0.0, 0.0)
+        self._fill_light_intensity = 0.0
         self._rebuild_renderer()
 
     def set_light_direction(self, light_direction):
-        """Update the directional light without toggling shadows. Cheap
-        (uniform-only when the shadow geometry is unchanged)."""
+        """Update the directional key light without toggling shadows.
+        Uniform-only; triggers a shadow rebuild if shadows are on."""
         self._light_direction = tuple(float(x) for x in light_direction)
         if self._renderer is not None:
             self._renderer.material.light_direction = self._light_direction
-            # Changing the light requires rebuilding the shadow texture
-            # but not the compute pipeline.
             if self._shadows_enabled:
                 self._refresh_shadow_volume()
+            self.view.request_redraw()
+
+    def set_key_light_intensity(self, intensity: float):
+        """Scale the key (shadowed) light's direct contribution. Uniform-only."""
+        self._light_intensity = float(intensity)
+        if self._renderer is not None:
+            self._renderer.material.light_intensity = self._light_intensity
+            self.view.request_redraw()
+
+    def set_fill_light(self, direction, intensity: float = 0.5):
+        """Set the unshadowed fill light. ``direction`` is surface->light.
+        Pass ``direction=None`` or ``intensity=0`` to disable. Uniform-only;
+        fill light does not participate in the shadow compute pass."""
+        if direction is None or intensity <= 0:
+            self._fill_light_direction = (0.0, 0.0, 0.0)
+            self._fill_light_intensity = 0.0
+        else:
+            self._fill_light_direction = tuple(float(x) for x in direction)
+            self._fill_light_intensity = float(intensity)
+        if self._renderer is not None:
+            self._renderer.material.fill_light_direction = self._fill_light_direction
+            self._renderer.material.fill_light_intensity = self._fill_light_intensity
             self.view.request_redraw()
 
     def _refresh_shadow_volume(self):
