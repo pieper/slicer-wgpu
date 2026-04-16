@@ -65,6 +65,10 @@ struct FieldSample {
     hit: bool,
 };
 
+// ==== Shadow sampling (stub or real, depending on shader variant) ====
+__SAMPLE_SHADOW_FN__
+// ==== End shadow sampling ====
+
 // ==== Per-field WGSL (generated) ====
 __FIELD_FUNCTIONS__
 // ==== End per-field WGSL ====
@@ -225,6 +229,8 @@ class SceneMaterial(pygfx.Material):
         self.background = (0.05, 0.05, 0.08, 1.0)
         self.scene_bounds_min = (-100.0, -100.0, -100.0)
         self.scene_bounds_max = (100.0, 100.0, 100.0)
+        # Zero means "use per-pixel headlight" in the fragment shader.
+        self.light_direction = (0.0, 0.0, 0.0, 0.0)
         self.sample_step = 1.0
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -266,6 +272,12 @@ class SceneMaterial(pygfx.Material):
         self.uniform_buffer.data["sample_step"] = float(v)
         self.uniform_buffer.update_full()
 
+    @property
+    def light_direction(self):
+        return tuple(float(x) for x in self.uniform_buffer.data["light_direction"][:3])
+    @light_direction.setter
+    def light_direction(self, v): self._set_vec4("light_direction", v)
+
 
 def make_material_class(fields: list[Field], slot_indices: list[int]):
     """Dynamically build a SceneMaterial subclass with the right per-field
@@ -284,6 +296,11 @@ def make_material_class(fields: list[Field], slot_indices: list[int]):
     uniform_type["background"]        = "4xf4"
     uniform_type["scene_bounds_min"]  = "4xf4"
     uniform_type["scene_bounds_max"]  = "4xf4"
+    # light_direction points FROM the surface TO the light (same convention
+    # as the shadow compute pass). When its length is <1e-6, the fragment
+    # shader falls back to a per-pixel headlight, preserving the
+    # unshaded-default look for callers that haven't opted into shadows.
+    uniform_type["light_direction"]   = "4xf4"
     uniform_type["sample_step"]       = "f4"
 
     # Per-field uniforms
@@ -312,6 +329,52 @@ def make_material_class(fields: list[Field], slot_indices: list[int]):
     return obj_cls, mat_cls
 
 
+_SAMPLE_SHADOW_STUB = """
+fn sample_shadow(wp: vec3<f32>) -> f32 {
+    return 1.0;
+}
+"""
+
+_SAMPLE_SHADOW_REAL = """
+fn sample_shadow(wp: vec3<f32>) -> f32 {
+    let bmin = u_material.scene_bounds_min.xyz;
+    let bmax = u_material.scene_bounds_max.xyz;
+    let extent = bmax - bmin;
+    let safe_extent = vec3<f32>(
+        max(extent.x, 1e-6),
+        max(extent.y, 1e-6),
+        max(extent.z, 1e-6),
+    );
+    let uvw = (wp - bmin) / safe_extent;
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) {
+        return 1.0;
+    }
+    return textureSampleLevel(t_shadow, s_shadow, uvw, 0.0).r;
+}
+"""
+
+
+# pygfx's get_cached_shader_module (engine/pipeline.py) keys its cache on
+# `shader.hash`, which -- when the class fullname has >=2 dots -- is
+# derived from fullname(module.class) alone. Without disambiguation the
+# cache would hit across module reloads and shader-template edits,
+# silently re-using a stale compiled pipeline.
+#
+# We want cache HITS when the WGSL is unchanged (production: same field
+# configuration re-built many times) and cache MISSES when the WGSL
+# content changes (developer edits SHADER_TEMPLATE, a new field kind
+# appears, shadows get enabled, etc.). A content hash of the generated
+# WGSL achieves both: we fold an 8-hex-char MD5 of the WGSL into the
+# shader class `__name__`, so identical WGSL yields identical classnames
+# and pygfx's cache does the right thing automatically.
+import hashlib as _hashlib
+
+
+def _shader_name_for(wgsl: str) -> str:
+    digest = _hashlib.md5(wgsl.encode("utf-8")).hexdigest()[:8]
+    return f"_SceneShader_{digest}"
+
+
 class SceneRenderer(pygfx.WorldObject):
     """Screen-space scene renderer. Owns a list of Fields; the shader is
     generated from that list when `build_for_fields` constructs the
@@ -327,9 +390,15 @@ class SceneRenderer(pygfx.WorldObject):
         self._shader_wgsl: str = ""
 
     @classmethod
-    def build_for_fields(cls, fields: Iterable[Field]) -> "SceneRenderer":
+    def build_for_fields(cls, fields: Iterable[Field],
+                         shadow_volume=None) -> "SceneRenderer":
         """Construct a SceneRenderer + matching SceneMaterial subclass for
         the given list of fields. The shader is generated and registered.
+
+        If ``shadow_volume`` is provided (a ``shadows.ShadowVolume`` instance),
+        the fragment shader is compiled with ``t_shadow``/``s_shadow``
+        bindings and a real ``sample_shadow(wp)``; otherwise
+        ``sample_shadow`` returns 1.0 and no shadow texture is bound.
         """
         fields = list(fields)
         # Assign slot indices per field-kind (img0, img1, fid0, fid1, ...).
@@ -342,13 +411,23 @@ class SceneRenderer(pygfx.WorldObject):
 
         obj_cls, mat_cls = make_material_class(fields, slot_indices)
 
+        shadowed = shadow_volume is not None
+        sample_shadow_src = _SAMPLE_SHADOW_REAL if shadowed else _SAMPLE_SHADOW_STUB
+
         # Generate the WGSL once, store on the class so the shader's
         # get_code() can read it back.
         wgsl = (
             _SHADER_TEMPLATE
+            .replace("__SAMPLE_SHADOW_FN__", sample_shadow_src)
             .replace("__FIELD_FUNCTIONS__", _build_field_functions_block(fields, slot_indices))
             .replace("__FIELD_DISPATCH__",  _build_field_dispatch_block(fields, slot_indices))
         )
+
+        # Content-addressed shader class name: identical WGSL produces
+        # identical class names (cache hit in production), and ANY
+        # change to the generated WGSL produces a new class name
+        # (cache miss, fresh compile). See _shader_name_for.
+        _shader_cls_name = _shader_name_for(wgsl)
 
         # Register the shader for this class pair (idempotent: pygfx
         # caches by (obj_cls, mat_cls) and we just minted both).
@@ -371,6 +450,15 @@ class SceneRenderer(pygfx.WorldObject):
                 # Per-field bindings (textures, samplers).
                 for f, s in zip(wobject._fields, wobject._slot_indices):
                     bindings.extend(f.get_bindings(s))
+                # Shadow bindings, when this renderer was built with shadows.
+                sv = getattr(wobject, "_shadow_volume", None)
+                if sv is not None:
+                    bindings.extend([
+                        Binding("s_shadow", "sampler/filtering",
+                                GfxSampler("linear", "clamp"), FRAGMENT_ONLY),
+                        Binding("t_shadow", "texture/auto",
+                                GfxTextureView(sv.pygfx_texture), FRAGMENT_ONLY),
+                    ])
                 bindings = {i: b for i, b in enumerate(bindings)}
                 self.define_bindings(0, bindings)
                 return {0: bindings}
@@ -387,9 +475,13 @@ class SceneRenderer(pygfx.WorldObject):
             def get_code(self):
                 return self._wgsl
 
+        _SceneShader.__name__ = _shader_cls_name
+        _SceneShader.__qualname__ = _shader_cls_name
+
         material = mat_cls()
         renderer = obj_cls(material)
         renderer._fields = fields
+        renderer._shadow_volume = shadow_volume
         renderer._slot_indices = slot_indices
         renderer._field_mtimes = [f.mtime for f in fields]
         renderer._shader_wgsl = wgsl

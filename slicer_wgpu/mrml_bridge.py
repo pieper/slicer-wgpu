@@ -737,6 +737,11 @@ class SceneRendererManager:
     def __init__(self, view):
         self.view = view
         self._renderer: SceneRenderer | None = None
+        # Shadow (cinematic) state. Off by default so existing callers
+        # aren't affected; call enable_shadows(light_direction) to opt in.
+        self._shadows_enabled = False
+        self._light_direction = (0.0, 0.0, 0.0)
+        self._shadow_resolution = 256
         # Suppress structure-change callbacks while we populate the
         # displayer list: each Displayer's __init__ scans the scene and
         # would call back into _rebuild_renderer before _displayers is
@@ -830,6 +835,13 @@ class SceneRendererManager:
                 f.fill_uniforms(self._renderer.material.uniform_buffer, s)
         self._renderer.material.uniform_buffer.update_full()
         self._renderer.recompute_scene_bounds()
+        # Shadows depend on TF + transform + scene bounds, all of which may
+        # just have changed. Rebuild the transmittance volume too -- but
+        # only when we're not mid-drag, where the user cares about
+        # responsiveness more than shadow accuracy.
+        if (self._shadows_enabled
+                and self._interaction_depth == 0):
+            self._refresh_shadow_volume()
         self.view.request_redraw()
 
     def _on_interaction_start(self):
@@ -854,6 +866,11 @@ class SceneRendererManager:
             step_mult=None,  # restore from saved baseline
         )
         self._saved_pixel_ratio = None
+        # Rebuild shadows once the drag ends, since _on_field_modified
+        # was skipping them during the drag.
+        if self._shadows_enabled:
+            self._refresh_shadow_volume()
+            self.view.request_redraw()
 
     def _apply_interaction_settings(self, pixel_ratio, step_mult):
         """Push the pixel ratio and per-field sample_step_mm through to
@@ -891,6 +908,7 @@ class SceneRendererManager:
         self.view.request_redraw()
 
     def _rebuild_renderer(self):
+        from .fields.image import ImageField
         fields = self._gather_fields()
 
         # Drop the existing renderer (the SceneMaterial subclass is
@@ -906,14 +924,97 @@ class SceneRendererManager:
             self.view.request_redraw()
             return
 
+        # If shadows are enabled and at least one ImageField is present,
+        # build a ShadowVolume and hand it to the renderer. The ShadowVolume
+        # is created fresh per rebuild so its compute pipeline matches the
+        # current field configuration.
+        shadow_volume = None
+        image_fields = [f for f in fields if isinstance(f, ImageField)]
+        if self._shadows_enabled and image_fields:
+            try:
+                from .shadows import ShadowVolume
+                from pygfx.renderers.wgpu.engine.shared import get_shared
+                dev = get_shared().device
+                sv = ShadowVolume(dev, resolution=self._shadow_resolution)
+                sv.build_pipeline_for_image_fields(image_fields)
+                shadow_volume = sv
+            except Exception as e:
+                print(f"SceneRendererManager: shadow pipeline build failed: {e}")
+
         try:
-            self._renderer = SceneRenderer.build_for_fields(fields)
+            self._renderer = SceneRenderer.build_for_fields(
+                fields, shadow_volume=shadow_volume)
         except Exception as e:
             print(f"SceneRendererManager: build_for_fields failed: {e}")
             return
 
+        # Push current light direction into the scene material uniform,
+        # regardless of whether shadows are on -- a zero vector keeps
+        # the fragment shader's per-pixel headlight fallback.
+        try:
+            self._renderer.material.light_direction = self._light_direction
+        except Exception as e:
+            print(f"SceneRendererManager: light_direction set failed: {e}")
+
+        # Populate the shadow texture immediately.
+        if shadow_volume is not None:
+            self._refresh_shadow_volume()
+
         self.view.add(self._renderer)
         self.view.request_redraw()
+
+    # ----- Shadows -----
+
+    def enable_shadows(self, light_direction, resolution: int = 256):
+        """Turn on soft volumetric shadows cast by ImageFields.
+
+        ``light_direction`` is a world-space vector pointing FROM the
+        surface TO the light (the same vector you'd use in an NdotL
+        term). A zero vector disables the directional light and restores
+        the per-pixel headlight fallback.
+        """
+        self._shadows_enabled = True
+        self._light_direction = tuple(float(x) for x in light_direction)
+        self._shadow_resolution = int(resolution)
+        self._rebuild_renderer()
+
+    def disable_shadows(self):
+        """Return to plain headlight rendering with no shadow compute."""
+        self._shadows_enabled = False
+        self._light_direction = (0.0, 0.0, 0.0)
+        self._rebuild_renderer()
+
+    def set_light_direction(self, light_direction):
+        """Update the directional light without toggling shadows. Cheap
+        (uniform-only when the shadow geometry is unchanged)."""
+        self._light_direction = tuple(float(x) for x in light_direction)
+        if self._renderer is not None:
+            self._renderer.material.light_direction = self._light_direction
+            # Changing the light requires rebuilding the shadow texture
+            # but not the compute pipeline.
+            if self._shadows_enabled:
+                self._refresh_shadow_volume()
+            self.view.request_redraw()
+
+    def _refresh_shadow_volume(self):
+        """Re-dispatch the shadow compute pass using the renderer's
+        current scene bounds and ImageField uniforms. Cheap -- no GPU
+        resource allocation."""
+        from .fields.image import ImageField
+        if self._renderer is None:
+            return
+        sv = getattr(self._renderer, "_shadow_volume", None)
+        if sv is None:
+            return
+        image_fields = [f for f in self._renderer.fields()
+                        if isinstance(f, ImageField)]
+        if not image_fields:
+            return
+        bmin = self._renderer.material.scene_bounds_min
+        bmax = self._renderer.material.scene_bounds_max
+        sv.build(bmin=bmin, bmax=bmax,
+                 light_dir=self._light_direction,
+                 image_fields=image_fields)
 
     # ----- Picking (pointer event handlers) -----
 

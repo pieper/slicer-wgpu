@@ -342,13 +342,24 @@ fn sample_field_img{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
         var n = grad / grad_len;
         if (dot(n, -ray_dir) < 0.0) {{ n = -n; }}
         let view_dir = normalize(ray_origin - wp);
-        let to_light = view_dir;  // headlight
+        // u_material.light_direction points FROM surface TO light.
+        // Zero-vector means "no directional light set" and we fall back
+        // to the per-pixel headlight used before enable_shadows existed.
+        var to_light = u_material.light_direction.xyz;
+        let ld_len = length(to_light);
+        if (ld_len < 1e-6) {{
+            to_light = view_dir;
+        }} else {{
+            to_light = to_light / ld_len;
+        }}
         let ldotn = dot(to_light, n);
         if (ldotn > 0.0) {{
             let refl = normalize(2.0 * ldotn * n - to_light);
             let rdotv = max(0.0, dot(refl, view_dir));
-            lit = tf.rgb * (u_material.img{i}_k_ambient + u_material.img{i}_k_diffuse * ldotn)
-                + vec3<f32>(u_material.img{i}_k_specular * pow(rdotv, u_material.img{i}_shininess));
+            let shadow = sample_shadow(wp);
+            let direct = tf.rgb * u_material.img{i}_k_diffuse * ldotn
+                       + vec3<f32>(u_material.img{i}_k_specular * pow(rdotv, u_material.img{i}_shininess));
+            lit = tf.rgb * u_material.img{i}_k_ambient + direct * shadow;
         }}
     }}
     out.hit = true;
