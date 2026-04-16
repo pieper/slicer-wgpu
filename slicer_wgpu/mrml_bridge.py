@@ -228,7 +228,9 @@ _install_silent_loop()
 
 
 from .scene_renderer import SceneRenderer
-from .displayers import VolumeRenderingDisplayer, FiducialDisplayer
+from .displayers import (
+    VolumeRenderingDisplayer, FiducialDisplayer, TransformDisplayer,
+)
 
 
 # ------------------------------------------------------------------------
@@ -797,11 +799,20 @@ class SceneRendererManager:
         self._saved_sample_steps: dict[int, float] = {}
         self._interaction_pixel_ratio = 0.5
         self._interaction_step_mult = 2.0
+        # TransformDisplayer goes first so volume/fiducial displayers can
+        # resolve their parent-transform chain against existing grid
+        # transforms during their initial scene scan.
+        self._transform_displayer = TransformDisplayer(
+            on_structure_changed=self._on_structure_changed,
+            on_field_modified=self._on_field_modified,
+        )
+        self._displayers.append(self._transform_displayer)
         self._displayers.append(VolumeRenderingDisplayer(
             on_structure_changed=self._on_structure_changed,
             on_field_modified=self._on_field_modified,
             on_interaction_start=self._on_interaction_start,
             on_interaction_end=self._on_interaction_end,
+            transform_provider=self._transform_displayer,
         ))
         self._displayers.append(FiducialDisplayer(
             on_structure_changed=self._on_structure_changed,

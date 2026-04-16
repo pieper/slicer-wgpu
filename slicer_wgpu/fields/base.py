@@ -73,6 +73,14 @@ class Field(ABC):
 
     def __init__(self):
         self._mtime = 0
+        # Optional TransformField that warps the sampling position of
+        # this field. The SceneRenderer emits a
+        # ``transform_point_<kind><slot>(wp)`` helper per field that
+        # either returns ``wp`` (no transform) or
+        # ``wp + displacement_grid<M>(wp)`` (transform attached). Every
+        # subclass's sampling_wgsl is expected to call this helper at
+        # the top of its sampling path.
+        self.transform_field = None
 
     # ---- WGSL generation hooks ----
 

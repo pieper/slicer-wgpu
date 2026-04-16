@@ -206,6 +206,53 @@ def _build_field_functions_block(fields: list[Field], slot_indices: list[int]) -
     return "\n".join(chunks)
 
 
+def _gather_transform_fields(fields: list[Field]):
+    """Walk the fields list and return (ordered_unique_transform_fields,
+    tf_id_to_slot, field_to_tf_slot) so the same MRML grid transform
+    shared by multiple receivers emits its WGSL / bindings / uniforms
+    only once. Slots are assigned in first-seen order starting at 0.
+    """
+    ordered: list = []
+    tf_id_to_slot: dict = {}
+    field_to_tf_slot: dict = {}
+    for f in fields:
+        tf = getattr(f, "transform_field", None)
+        if tf is None:
+            continue
+        key = id(tf)
+        if key not in tf_id_to_slot:
+            tf_id_to_slot[key] = len(ordered)
+            ordered.append(tf)
+        field_to_tf_slot[id(f)] = tf_id_to_slot[key]
+    return ordered, tf_id_to_slot, field_to_tf_slot
+
+
+def _build_transform_helpers_block(fields: list[Field],
+                                   slot_indices: list[int],
+                                   field_to_tf_slot: dict) -> str:
+    """Per regular field, emit ``transform_point_<kind><slot>(wp)``
+    which returns wp (identity) or wp + displacement_grid<M>(wp). The
+    receiver's sampling_wgsl calls this helper at the top of its
+    sampling path, so attaching / swapping a TransformField changes the
+    receiver's apparent data without that receiver needing to know
+    anything about grid slot numbers.
+    """
+    lines = []
+    for field, slot in zip(fields, slot_indices):
+        kind = field.field_kind
+        tf_slot = field_to_tf_slot.get(id(field))
+        if tf_slot is None:
+            body = "    return wp;"
+        else:
+            body = f"    return wp + displacement_grid{tf_slot}(wp);"
+        lines.append(
+            f"fn transform_point_{kind}{slot}(wp: vec3<f32>) -> vec3<f32> {{\n"
+            f"{body}\n"
+            f"}}\n"
+        )
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # Material + WorldObject
 # ----------------------------------------------------------------------
@@ -311,11 +358,17 @@ class SceneMaterial(pygfx.Material):
         self.uniform_buffer.update_full()
 
 
-def make_material_class(fields: list[Field], slot_indices: list[int]):
+def make_material_class(fields: list[Field], slot_indices: list[int],
+                        transform_fields: list | None = None):
     """Dynamically build a SceneMaterial subclass with the right per-field
     uniform layout, and a SceneRenderer subclass paired with it. pygfx
     caches the compiled shader by (WorldObject class, Material class), so
     a fresh class per field configuration gives us the desired recompile.
+
+    ``transform_fields`` is the ordered, deduplicated list of
+    TransformFields referenced by the regular fields. Their uniforms
+    (patient_to_texture matrix, gain) are added to the material after
+    the regular fields and before padding so the struct layout is stable.
     """
     uniform_type = dict(pygfx.Material.uniform_type)
     # Scene-wide uniforms. Do NOT add manual "__padXX" scalars to force
@@ -347,7 +400,20 @@ def make_material_class(fields: list[Field], slot_indices: list[int]):
                 raise ValueError(f"Uniform name collision: {k!r}")
             uniform_type[k] = t
 
-    suffix = "_" + "_".join(f"{f.field_kind}{s}" for f, s in zip(fields, slot_indices)) or "_empty"
+    # TransformField uniforms (one slot per deduplicated TF). TFs also
+    # participate in the class-name suffix so the pygfx shader cache
+    # keys on (field config, tf count) pairs correctly.
+    tfs = list(transform_fields or [])
+    for tf_slot, tf in enumerate(tfs):
+        for k, t in tf.uniform_type(tf_slot).items():
+            if k in uniform_type:
+                raise ValueError(f"Uniform name collision: {k!r}")
+            uniform_type[k] = t
+
+    suffix_parts = [f"{f.field_kind}{s}" for f, s in zip(fields, slot_indices)]
+    if tfs:
+        suffix_parts.append(f"grids{len(tfs)}")
+    suffix = "_" + "_".join(suffix_parts) or "_empty"
     mat_cls = type(
         "SceneMaterial" + suffix,
         (SceneMaterial,),
@@ -446,17 +512,36 @@ class SceneRenderer(pygfx.WorldObject):
             slot_indices.append(n)
             per_kind_count[f.field_kind] = n + 1
 
-        obj_cls, mat_cls = make_material_class(fields, slot_indices)
+        # Gather the distinct TransformFields referenced by any field and
+        # give each a grid0, grid1, ... slot. The same MRML grid transform
+        # can be shared by multiple receivers, so we dedupe by object id.
+        transform_fields, _tf_id_to_slot, field_to_tf_slot = \
+            _gather_transform_fields(fields)
+
+        obj_cls, mat_cls = make_material_class(
+            fields, slot_indices, transform_fields=transform_fields)
 
         shadowed = shadow_volume is not None
         sample_shadow_src = _SAMPLE_SHADOW_REAL if shadowed else _SAMPLE_SHADOW_STUB
 
+        # TransformField sampling functions must be declared BEFORE the
+        # per-receiver transform_point_* helpers that call them.
+        tf_block = "\n".join(tf.sampling_wgsl(i)
+                             for i, tf in enumerate(transform_fields))
+        tp_block = _build_transform_helpers_block(
+            fields, slot_indices, field_to_tf_slot)
+
         # Generate the WGSL once, store on the class so the shader's
         # get_code() can read it back.
+        field_functions = (
+            tf_block
+            + "\n" + tp_block
+            + "\n" + _build_field_functions_block(fields, slot_indices)
+        )
         wgsl = (
             _SHADER_TEMPLATE
             .replace("__SAMPLE_SHADOW_FN__", sample_shadow_src)
-            .replace("__FIELD_FUNCTIONS__", _build_field_functions_block(fields, slot_indices))
+            .replace("__FIELD_FUNCTIONS__", field_functions)
             .replace("__FIELD_DISPATCH__",  _build_field_dispatch_block(fields, slot_indices))
         )
 
@@ -487,6 +572,10 @@ class SceneRenderer(pygfx.WorldObject):
                 # Per-field bindings (textures, samplers).
                 for f, s in zip(wobject._fields, wobject._slot_indices):
                     bindings.extend(f.get_bindings(s))
+                # TransformField bindings (shared across receivers).
+                for tf_slot, tf in enumerate(
+                        getattr(wobject, "_transform_fields", ()) or ()):
+                    bindings.extend(tf.get_bindings(tf_slot))
                 # Shadow bindings, when this renderer was built with shadows.
                 sv = getattr(wobject, "_shadow_volume", None)
                 if sv is not None:
@@ -521,6 +610,8 @@ class SceneRenderer(pygfx.WorldObject):
         renderer._shadow_volume = shadow_volume
         renderer._slot_indices = slot_indices
         renderer._field_mtimes = [f.mtime for f in fields]
+        renderer._transform_fields = transform_fields
+        renderer._transform_mtimes = [t.mtime for t in transform_fields]
         renderer._shader_wgsl = wgsl
 
         # Initial uniform fill + scene bounds
@@ -535,12 +626,21 @@ class SceneRenderer(pygfx.WorldObject):
 
     def needs_rebuild_for(self, fields: Iterable[Field]) -> bool:
         """True if the field list's structure has changed (count or kind),
-        which requires a fresh SceneRenderer/SceneMaterial pair."""
+        which requires a fresh SceneRenderer/SceneMaterial pair. Adding
+        or removing a TransformField from any receiver is also a
+        structural change -- the shader needs to emit new bindings and
+        a new transform_point helper body."""
         new = list(fields)
         if len(new) != len(self._fields):
             return True
         for old, nf in zip(self._fields, new):
             if old.field_kind != nf.field_kind:
+                return True
+            # id() is intentional: swapping one TransformField for another
+            # changes the grid slot binding even if both have the same
+            # dimensions / type.
+            if id(getattr(old, "transform_field", None)) != \
+                    id(getattr(nf, "transform_field", None)):
                 return True
         return False
 
@@ -549,6 +649,8 @@ class SceneRenderer(pygfx.WorldObject):
         change). Does not regenerate the shader."""
         for f, s in zip(self._fields, self._slot_indices):
             f.fill_uniforms(self.material.uniform_buffer, s)
+        for i, tf in enumerate(getattr(self, "_transform_fields", ()) or ()):
+            tf.fill_uniforms(self.material.uniform_buffer, i)
         self.material.uniform_buffer.update_full()
 
     def maybe_refresh(self) -> bool:
@@ -558,6 +660,10 @@ class SceneRenderer(pygfx.WorldObject):
         for i, f in enumerate(self._fields):
             if f.mtime != self._field_mtimes[i]:
                 self._field_mtimes[i] = f.mtime
+                changed = True
+        for i, tf in enumerate(getattr(self, "_transform_fields", ()) or ()):
+            if tf.mtime != self._transform_mtimes[i]:
+                self._transform_mtimes[i] = tf.mtime
                 changed = True
         if changed:
             self.refresh_uniforms()

@@ -8,5 +8,7 @@ and arbitrates structural-vs-uniform updates.
 from .base import Displayer
 from .volume import VolumeRenderingDisplayer
 from .fiducial import FiducialDisplayer
+from .transform import TransformDisplayer
 
-__all__ = ["Displayer", "VolumeRenderingDisplayer", "FiducialDisplayer"]
+__all__ = ["Displayer", "VolumeRenderingDisplayer", "FiducialDisplayer",
+           "TransformDisplayer"]

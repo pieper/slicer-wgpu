@@ -155,6 +155,12 @@ fn sample_field_fid{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
     out.opacity = 0.0;
     if (u_material.fid{i}_visible < 0.5) {{ return out; }}
 
+    // Sphere centers are stored in the receiver's reference frame; a
+    // TransformField attached to this field warps the per-sample world
+    // position into that frame before the SDF test, so the spheres
+    // appear displaced by the grid.
+    let wp_r = transform_point_fid{i}(wp);
+
     let n = i32(u_material.fid{i}_n_spheres);
     var best_depth = -1.0;       // depth of penetration (radius - distance)
     var best_center = vec3<f32>(0.0);
@@ -168,7 +174,7 @@ fn sample_field_fid{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
         let sp = u_material.fid{i}_spheres[k];
         let r = sp.w;
         if (r <= 0.0) {{ continue; }}
-        let to_wp = wp - sp.xyz;
+        let to_wp = wp_r - sp.xyz;
         let d = length(to_wp);
         let depth = r - d;       // > 0 -> inside
         if (depth > best_depth) {{
@@ -182,7 +188,7 @@ fn sample_field_fid{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
 
     if (!found || best_depth <= 0.0) {{ return out; }}
 
-    let to_wp = wp - best_center;
+    let to_wp = wp_r - best_center;
     var n_hat = to_wp / max(length(to_wp), 1e-6);
     if (dot(n_hat, -ray_dir) < 0.0) {{ n_hat = -n_hat; }}
 

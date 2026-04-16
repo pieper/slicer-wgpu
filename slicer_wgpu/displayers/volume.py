@@ -33,6 +33,31 @@ def _world_from_local_for_volume(volume_node) -> np.ndarray:
 class VolumeRenderingDisplayer(Displayer):
     node_class = "vtkMRMLVolumeRenderingDisplayNode"
 
+    def __init__(self, *args, transform_provider=None, **kwargs):
+        # ``transform_provider`` is typically a TransformDisplayer. It
+        # resolves a volume node to its TransformField (if a grid
+        # transform is in the parent chain). Passed in rather than
+        # imported to keep Displayer instantiation order explicit.
+        self._transform_provider = transform_provider
+        super().__init__(*args, **kwargs)
+
+    def _attach_transform_field(self, field, volume_node) -> bool:
+        """Point ``field.transform_field`` at the right TransformField
+        for this volume's parent-transform chain. Returns True if the
+        attached TransformField identity changed (which is a structural
+        change for the SceneRenderer)."""
+        new_tf = None
+        if self._transform_provider is not None:
+            try:
+                new_tf = self._transform_provider.transform_field_for_volume(
+                    volume_node)
+            except Exception as e:
+                print(f"VolumeRenderingDisplayer transform resolve: {e}")
+                new_tf = None
+        changed = id(getattr(field, "transform_field", None)) != id(new_tf)
+        field.transform_field = new_tf
+        return changed
+
     def _extra_watch(self, node, tags) -> None:
         vp = node.GetVolumePropertyNode()
         if vp is not None:
@@ -102,7 +127,14 @@ class VolumeRenderingDisplayer(Displayer):
         except Exception as e:
             print(f"VolumeRenderingDisplayer transform update: {e}")
             return
-        self._on_field_modified(field)
+        # Re-parenting can move a grid transform in or out of the chain.
+        # Detect that and escalate to a structural change so the renderer
+        # rebuilds with / without the grid binding.
+        structural = self._attach_transform_field(field, caller)
+        if structural:
+            self._on_structure_changed()
+        else:
+            self._on_field_modified(field)
 
     def _make_field(self, node):
         vol_node = node.GetVolumeNode()
@@ -111,6 +143,7 @@ class VolumeRenderingDisplayer(Displayer):
         try:
             field = ImageField.from_volume_node(vol_node, node)
             field.set_world_from_local(_world_from_local_for_volume(vol_node))
+            self._attach_transform_field(field, vol_node)
             return field
         except Exception as e:
             print(f"VolumeRenderingDisplayer._make_field: {e}")
@@ -129,7 +162,11 @@ class VolumeRenderingDisplayer(Displayer):
         if vol_node is not None:
             try:
                 field.refresh_from_display_node(vol_node, node)
-                return False
+                # Display-node updates can't change the parent transform,
+                # but an external re-parent may have happened between
+                # ticks. Re-resolve the grid TF so we notice.
+                structural = self._attach_transform_field(field, vol_node)
+                return structural
             except Exception as e:
                 print(f"VolumeRenderingDisplayer TF fast path failed, "
                       f"falling back to full rebuild: {e}")

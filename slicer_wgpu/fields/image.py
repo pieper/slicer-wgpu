@@ -279,9 +279,14 @@ class ImageField(Field):
 
     def sampling_wgsl(self, slot_idx: int) -> str:
         i = slot_idx
+        # Each volume / gradient sample warps its world position through
+        # transform_point_img<i> first, so an attached TransformField
+        # deforms both the opacity and the Phong gradient self-consistently
+        # (neighbor samples for the gradient are warped individually).
         return f"""
 fn sample_volume_world_img{i}(wp: vec3<f32>) -> vec2<f32> {{
-    let tex4 = u_material.img{i}_patient_to_texture * vec4<f32>(wp, 1.0);
+    let wp_r = transform_point_img{i}(wp);
+    let tex4 = u_material.img{i}_patient_to_texture * vec4<f32>(wp_r, 1.0);
     let tex = tex4.xyz;
     if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) {{
         return vec2<f32>(0.0, 0.0);
@@ -290,7 +295,8 @@ fn sample_volume_world_img{i}(wp: vec3<f32>) -> vec2<f32> {{
     return vec2<f32>(v, 1.0);
 }}
 fn sample_volume_clamped_img{i}(wp: vec3<f32>) -> f32 {{
-    let tex4 = u_material.img{i}_patient_to_texture * vec4<f32>(wp, 1.0);
+    let wp_r = transform_point_img{i}(wp);
+    let tex4 = u_material.img{i}_patient_to_texture * vec4<f32>(wp_r, 1.0);
     let tex = clamp(tex4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
     return textureSample(t_vol{i}, s_vol{i}, tex).r;
 }}
