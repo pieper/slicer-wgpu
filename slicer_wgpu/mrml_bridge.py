@@ -419,6 +419,15 @@ class PygfxView:
 
     def close(self):
         self._closed = True
+        # Drop every bound method we handed to pygfx/Qt event pumps,
+        # otherwise each captures `self` and keeps the whole view chain
+        # (renderer, scene, ImageField, volume texture) alive forever.
+        try:
+            self.renderer.remove_event_handler(
+                self._on_controller_event, "pointer_move", "wheel")
+        except Exception:
+            pass
+        self._before_render_callbacks = []
         try:
             self.widget.draw_frame = None
         except Exception:
@@ -430,6 +439,10 @@ class PygfxView:
             self.widget.close()
         except Exception:
             pass
+        # Any QTimer.singleShot(0, self._do_redraw) still pending when
+        # close fires will drop into a closed-branch no-op, but it still
+        # pins self briefly; that's fine because Qt drains pending
+        # singleShots within the same event-loop iteration.
 
     def reset_camera(self):
         has_content = any(
@@ -831,11 +844,18 @@ class SceneRendererManager:
         # accepted, so fall back to registering without it — we lose
         # priority but pick/drag still works because the controller
         # accepts/ignores based on button.
+        # Remember each (handler, kind) pair so cleanup() can un-register
+        # them. Without that, the bound methods stay in the renderer's
+        # event registry and keep this manager (and its ImageField
+        # texture) alive forever -- textbook cleanup leak.
+        self._pointer_handlers: list = []
+
         def _add(handler, kind):
             try:
                 view.renderer.add_event_handler(handler, kind, order=-10)
             except TypeError:
                 view.renderer.add_event_handler(handler, kind)
+            self._pointer_handlers.append((handler, kind))
         try:
             _add(self._on_pointer_down, "pointer_down")
             _add(self._on_pointer_move, "pointer_move")
@@ -852,21 +872,38 @@ class SceneRendererManager:
         self._rebuild_renderer()
 
     def cleanup(self):
+        # Break every strong reference back to self so GC can actually
+        # free this manager (and its ImageField, TransformField, pygfx
+        # Textures, shadow volume). In particular: pointer handlers and
+        # the before-render callback are bound methods in pygfx event
+        # registries; each one pins `self` on its own.
         try:
             self.view.remove_before_render_callback(self._before_render)
         except Exception:
             pass
+        try:
+            for handler, kind in getattr(self, "_pointer_handlers", ()):
+                try:
+                    self.view.renderer.remove_event_handler(handler, kind)
+                except Exception:
+                    pass
+        finally:
+            self._pointer_handlers = []
         for d in self._displayers:
             try:
                 d.cleanup()
             except Exception:
                 pass
+        # Drop renderer + displayer references so any left-over MRML
+        # observers that outlive cleanup can't resurrect the chain.
         if self._renderer is not None:
             try:
                 self.view.remove(self._renderer)
             except Exception:
                 pass
             self._renderer = None
+        self._displayers = []
+        self._drag_hit = None
 
     # ----- Structure / refresh routing -----
 
@@ -1551,7 +1588,32 @@ class CameraDisplayableManager(DisplayableManager):
             self._wheel_timer.stop()
         except Exception:
             pass
+        # Qt signal-slot connections hold a strong reference to the
+        # connected bound method, which holds self, which holds
+        # self.view (a PygfxView, expensive). Disconnect so self can
+        # be freed after this cleanup.
+        try:
+            self._wheel_timer.timeout.disconnect(self._flush_wheel_push)
+        except Exception:
+            pass
+        # Un-register the pygfx event handlers we added in __init__.
+        # Without this each bound method pins `self.view`, which pins
+        # the WgpuRenderer + scene + any ImageField textures.
+        try:
+            self.view.renderer.remove_event_handler(
+                self._on_pygfx_event,
+                "pointer_move", "pointer_up", "key_down")
+        except Exception:
+            pass
+        try:
+            self.view.renderer.remove_event_handler(
+                self._on_pygfx_wheel, "wheel")
+        except Exception:
+            pass
         super().cleanup()
+        # Break the final strong ref back to the PygfxView so GC can
+        # free the whole renderer + scene + ImageField chain.
+        self.view = None
 
 
 # ------------------------------------------------------------------------
