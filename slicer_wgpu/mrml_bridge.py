@@ -42,10 +42,221 @@ import PythonQt  # noqa: F401
 import PythonQt.QtCore  # noqa: F401
 import pygfx
 import pylinalg as la
-from rendercanvas.qt import QRenderWidget
+from rendercanvas.qt import QRenderWidget, QtLoop, WA_PaintOnScreen
+
+
+class _VtkStyleOrbitController(pygfx.OrbitController):
+    """OrbitController variant whose azimuth axis is the camera's
+    *current* view-up instead of the fixed ``reference_up``.
+
+    This matches vtkInteractorStyleTrackballCamera's behavior: if you
+    orbit up over the pole, the camera's view-up flips, and subsequent
+    horizontal motion continues to rotate around that (now-flipped) up.
+    pygfx's stock OrbitController azimuths around a world-fixed
+    reference_up, which near the pole feels "stuck" and doesn't match
+    Slicer's default 3D view interaction.
+
+    Elevation is unchanged: still about the camera's local right axis.
+    """
+
+    def _update_rotate(self, delta):
+        assert isinstance(delta, tuple) and len(delta) == 2
+
+        delta_azimuth, delta_elevation = delta
+        camera_state = self._get_camera_state()
+
+        position = camera_state["position"]
+        rotation = camera_state["rotation"]
+
+        # VTK-style: azimuth axis is the camera's *current* up in world
+        # space, derived from the rotation quaternion, not the fixed
+        # reference_up. Elevation axis is the camera's local right
+        # (+X), matching stock OrbitController.
+        current_up = la.vec_transform_quat((0, 1, 0), rotation)
+
+        # Clip elevation the same way stock OrbitController does so we
+        # don't flip past the pole unintentionally. We still compute
+        # against reference_up for the clip because it's a stable
+        # world-space axis.
+        forward = la.vec_transform_quat((0, 0, -1), rotation)
+        ref_up = camera_state["reference_up"]
+        elevation = la.vec_angle(forward, ref_up) - 0.5 * np.pi
+        bounds = -89 * np.pi / 180, 89 * np.pi / 180
+        new_elevation = elevation + delta_elevation
+        if new_elevation < bounds[0]:
+            delta_elevation = bounds[0] - elevation
+        elif new_elevation > bounds[1]:
+            delta_elevation = bounds[1] - elevation
+
+        r_azimuth = la.quat_from_axis_angle(current_up, -delta_azimuth)
+        r_elevation = la.quat_from_axis_angle((1, 0, 0), -delta_elevation)
+
+        rot1 = rotation
+        rot2 = la.quat_mul(r_azimuth, la.quat_mul(rot1, r_elevation))
+
+        pos1 = position
+        if self._custom_target is not None:
+            target_pos = self._custom_target
+            pos1_to_target = target_pos - pos1
+            pos1_to_target_rotated = la.vec_transform_quat(pos1_to_target, r_azimuth)
+            right = la.vec_transform_quat((1, 0, 0), rot1)
+            r_elevation_world = la.quat_from_axis_angle(right, -delta_elevation)
+            pos1_to_target_final = la.vec_transform_quat(
+                pos1_to_target_rotated, r_elevation_world)
+            pos2 = target_pos - pos1_to_target_final
+        else:
+            pos2target1 = self._get_target_vec(camera_state, rotation=rot1)
+            pos2target2 = self._get_target_vec(camera_state, rotation=rot2)
+            pos2 = pos1 + pos2target1 - pos2target2
+
+        self._set_camera_state({"position": pos2, "rotation": rot2})
+
+
+class _ScreenQRenderWidget(QRenderWidget):
+    """QRenderWidget that prefers wgpu's 'screen' present method over
+    rendercanvas's default 'bitmap'. Screen-present lets wgpu draw
+    directly into a CAMetalLayer / HWND / X11 window surface owned by
+    this widget, skipping the per-frame GPU->CPU readback + QImage
+    blit that bitmap-present does (~1.4 MB transfer per frame for a
+    typical view).
+
+    rendercanvas defaults to bitmap to sidestep Qt compositor issues
+    it has encountered across platforms (see rendercanvas/qt.py
+    _rc_get_present_info for the rationale). For our Slicer integration
+    we accept that risk in exchange for the performance -- if screen-
+    present doesn't work on a given build we can flip back to bitmap
+    by instantiating QRenderWidget instead.
+    """
+
+    def _rc_get_present_info(self, present_methods):
+        if "screen" in present_methods:
+            surface_ids = self._get_surface_ids()
+            if surface_ids:
+                # WA_PaintOnScreen implies WA_NativeWindow; Qt stops
+                # painting over the surface area so wgpu owns those
+                # pixels.
+                self.setAttribute(WA_PaintOnScreen, True)
+                return {"method": "screen", **surface_ids}
+        # Fall back to whatever rendercanvas would have picked.
+        return super()._rc_get_present_info(present_methods)
+
+
+class _SilentQtLoop(QtLoop):
+    """QtLoop subclass that never schedules tasks.
+
+    We keep a real QtLoop instance on the canvas group -- several
+    paths in rendercanvas/qt.py check `isinstance(loop, QtLoop)` and
+    take a different (worse) code path if False -- but override
+    _rc_add_task so nothing is ever added to the loop's task list.
+
+    Consequences:
+      * The keep-alive loop-task (`while True: await sleep(0.1)`
+        in rendercanvas/core/loop.py:198) is never started.
+      * Per-canvas Scheduler tasks are never started.
+      * __start -> __setup_interrupt_hooks never runs, so
+        rendercanvas does not install a SIGINT handler.
+      * No QTimer chain; paint events still arrive directly from Qt.
+
+    Redraws in our integration go through PygfxView.request_redraw,
+    which calls widget._process_events() + widget.force_draw() to
+    flush events and synchronously render + present the frame.
+    """
+
+    def _rc_add_task(self, async_func, name):
+        # Silently drop. We do not use rendercanvas's async machinery
+        # in Slicer; MRML events drive redraws via request_redraw.
+        return None
+
+
+# Install the silent loop on the canvas group singleton BEFORE any
+# QRenderWidget is constructed. _rc_canvas_group is a class attribute
+# on QRenderWidget (rendercanvas/qt.py:386). select_loop() raises
+# "Cannot select_loop() when live canvases exist" if canvases from a
+# prior import are still registered -- which happens whenever
+# _ensure_dependencies pops slicer_wgpu.mrml_bridge from sys.modules
+# and triggers a re-import. In that case the loop already in place
+# is (or was) our own _SilentQtLoop from the previous import cycle,
+# so we leave it alone. Detection is by class name because a
+# re-imported module produces a different class object even for the
+# "same" _SilentQtLoop.
+def _install_silent_loop():
+    current = QRenderWidget._rc_canvas_group.get_loop()
+    if type(current).__name__ == "_SilentQtLoop":
+        return
+    try:
+        QRenderWidget._rc_canvas_group.select_loop(_SilentQtLoop())
+    except RuntimeError:
+        # Live canvases exist but current loop isn't ours. Best we
+        # can do is neuter _rc_add_task on the existing QtLoop so
+        # it stops scheduling tasks going forward. This is belt-
+        # and-suspenders; the branch above normally catches re-import.
+        current._rc_add_task = lambda *_a, **_k: None
+
+
+_install_silent_loop()
+
 
 from .scene_renderer import SceneRenderer
 from .displayers import VolumeRenderingDisplayer, FiducialDisplayer
+
+
+# ------------------------------------------------------------------------
+# _SyncFlushFilter -- drain rendercanvas's EventEmitter on Qt events
+# ------------------------------------------------------------------------
+#
+# rendercanvas QRenderWidget's Qt event handlers (mouseMoveEvent,
+# mousePressEvent, wheelEvent, keyPressEvent, ...) submit events into
+# self._events, a rendercanvas EventEmitter that buffers them. The
+# buffer is normally drained by Scheduler._process_events(), which we
+# disabled along with the scheduler (see _SilentQtLoop above). Without
+# a drain, our pick handlers and the pygfx OrbitController -- both
+# registered via renderer.add_event_handler -- never see the events.
+#
+# This QObject event filter watches for the Qt event types that
+# QRenderWidget turns into rendercanvas events, and calls
+# widget._process_events() right after Qt's dispatch finishes. Events
+# flow in the natural Qt order:
+#
+#   Qt delivers event -> QRenderWidget's native handler submits to
+#   emitter -> this filter drains the emitter -> our Python handlers
+#   fire -> a handler may call self.request_redraw() -> Qt paintEvent
+#   is scheduled (coalesced) -> pygfx renders.
+#
+# No scheduler, no background task chain, no signal hooks. All event
+# dispatch runs on Qt's main thread in response to Qt events.
+def _flush_event_type_ints():
+    QE = qt.QEvent
+    return frozenset(int(t) for t in (
+        QE.MouseMove, QE.MouseButtonPress, QE.MouseButtonRelease,
+        QE.MouseButtonDblClick, QE.Wheel,
+        QE.KeyPress, QE.KeyRelease,
+        QE.Enter, QE.Leave,
+        QE.Resize,
+    ))
+
+
+class _SyncFlushFilter(qt.QObject):
+    """Qt event filter that drains a QRenderWidget's rendercanvas
+    event emitter immediately after Qt dispatches an event to it."""
+
+    _types = None
+
+    def __init__(self, widget):
+        super().__init__()
+        self._widget_ref = weakref.ref(widget)
+        if _SyncFlushFilter._types is None:
+            _SyncFlushFilter._types = _flush_event_type_ints()
+
+    def eventFilter(self, _obj, ev):
+        widget = self._widget_ref()
+        if widget is None:
+            return False
+        try:
+            if int(ev.type()) in self._types:
+                widget._process_events()
+        except Exception:
+            pass
+        return False  # never consume; QRenderWidget still gets the event
 
 
 # ------------------------------------------------------------------------
@@ -56,7 +267,10 @@ class PygfxView:
     """A pygfx render widget with scene, camera, orbit controller, and lights."""
 
     def __init__(self, parent=None):
-        self.widget = QRenderWidget(parent) if parent is not None else QRenderWidget()
+        self.widget = (
+            _ScreenQRenderWidget(parent) if parent is not None
+            else _ScreenQRenderWidget()
+        )
         # Match qMRMLThreeDView's size constraints so the controller (blue) bar
         # above us keeps its sizeHint height and we absorb all extra vertical
         # space on resize.
@@ -76,15 +290,30 @@ class PygfxView:
         # Camera + controller
         self.camera = pygfx.PerspectiveCamera(50, 4 / 3, depth_range=(0.1, 5000))
         self.camera.local.position = (0, 500, 0)
-        self.controller = pygfx.OrbitController(self.camera, register_events=self.renderer)
+        self.controller = _VtkStyleOrbitController(
+            self.camera, register_events=self.renderer)
 
         self._closed = False
         self._dirty = True
+        # Coalesce redraw requests: many request_redraw() calls in
+        # quick succession (e.g. a stream of pointer_move events during
+        # an orbit drag) all set this flag, but only one
+        # QTimer.singleShot(0, self._do_redraw) actually fires and
+        # does one render. Without this every mousemove would trigger
+        # a full synchronous ray-march and Qt input would stall.
+        self._redraw_pending = False
 
         try:
             self.renderer.add_event_handler(self._on_controller_event, "pointer_move", "wheel")
         except Exception:
             pass
+
+        # Drain rendercanvas's EventEmitter immediately on each Qt
+        # mouse/wheel/key/resize event so our Python handlers (pick,
+        # controller, hover) fire on the same Qt tick instead of
+        # waiting for the next redraw. See _SyncFlushFilter above.
+        self._sync_flush_filter = _SyncFlushFilter(self.widget)
+        self.widget.installEventFilter(self._sync_flush_filter)
 
         self.widget.request_draw(self._animate)
 
@@ -100,11 +329,37 @@ class PygfxView:
             print(f"PygfxView._animate render error: {e}")
 
     def request_redraw(self):
-        if self._closed:
+        """Request a redraw at the next idle moment, coalescing bursts
+        of requests into a single render. Safe to call at input-event
+        rate (every mousemove); Qt will collapse many requests into
+        one actual ray-march."""
+        if self._closed or self._redraw_pending:
             return
         self._dirty = True
+        self._redraw_pending = True
+        # singleShot(0) runs after the current Qt event finishes, so
+        # all synchronous Python work on this tick (event filter
+        # dispatch + controller updates) completes first, then one
+        # consolidated render happens.
+        qt.QTimer.singleShot(0, self._do_redraw)
+
+    def force_redraw(self):
+        """Synchronous version of request_redraw -- blocks until the
+        render + present completes. Use sparingly (self-tests that need
+        a settled frame before snapshotting)."""
+        if self._closed:
+            return
         try:
-            self.widget.request_draw()
+            self.widget.force_draw()
+        except Exception:
+            pass
+
+    def _do_redraw(self):
+        self._redraw_pending = False
+        if self._closed:
+            return
+        try:
+            self.widget.force_draw()
         except Exception:
             pass
 
@@ -114,11 +369,9 @@ class PygfxView:
             self.widget.draw_frame = None
         except Exception:
             pass
-        # Unregister the canvas from rendercanvas's internal loop list
-        # BEFORE Qt gets around to deleting the underlying QWidget. Skip
-        # this and the loop's scheduler keeps a stale QRenderWidget
-        # reference that crashes on the next SIGINT with "Trying to call
-        # 'parent' on a destroyed QWidget".
+        # widget.close() sends a closeEvent. With the rendercanvas
+        # scheduler disabled there is no task list to unregister from,
+        # but the close is still the right Qt-native teardown call.
         try:
             self.widget.close()
         except Exception:
@@ -828,10 +1081,16 @@ class CameraDisplayableManager(DisplayableManager):
         self._tracked_node_id = None
         self._suppress_mrml_event = False
         self._suppress_pygfx_push = False
+        self._last_pushed_signature = None
         super().__init__(view, mrml_scene)
 
         try:
-            view.renderer.add_event_handler(self._on_pygfx_event, "pointer_up", "key_down")
+            # pointer_move: live-sync during drag (matches VTK's direction,
+            # which fires camera-Modified continuously). pointer_up:
+            # final commit. key_down: keyboard-driven camera nudges.
+            view.renderer.add_event_handler(
+                self._on_pygfx_event,
+                "pointer_move", "pointer_up", "key_down")
             view.renderer.add_event_handler(self._on_pygfx_wheel, "wheel")
         except Exception as e:
             print(f"CameraDisplayableManager: could not register pygfx handler: {e}")
@@ -929,7 +1188,24 @@ class CameraDisplayableManager(DisplayableManager):
         cam_node = self.mrml_scene.GetNodeByID(self._tracked_node_id)
         if cam_node is None:
             return
+        # Skip the push if the pygfx camera state is identical to what
+        # we pushed last time. pointer_move fires even on idle hover
+        # (no active controller drag) and pushing then would cause a
+        # needless cam_node Modified fan-out to VTK, linked views, and
+        # the Slicer UI.
+        sig = self._pygfx_camera_signature()
+        if sig == self._last_pushed_signature:
+            return
+        self._last_pushed_signature = sig
         self._push_pygfx_to_mrml(cam_node)
+
+    def _pygfx_camera_signature(self):
+        pc = self.view.camera
+        pos = tuple(float(x) for x in pc.local.position)
+        up = tuple(float(x) for x in pc.local.up)
+        tgt = getattr(self.view.controller, "target", None)
+        tgt = tuple(float(x) for x in tgt) if tgt is not None else None
+        return (pos, up, tgt, float(pc.fov), float(pc.aspect))
 
     def _on_pygfx_wheel(self, ev):
         self._wheel_timer.stop()
@@ -1199,21 +1475,11 @@ class DualView:
         slicer.app.processEvents()
 
         self.view = PygfxView()
-        # Constructing the first PygfxView spins up rendercanvas's Qt
-        # loop, which installs its own SIGINT handler over Python's
-        # default_int_handler (see rendercanvas/core/loop.py:
-        # __setup_interrupt_hooks). The handler calls loop.stop() ->
-        # canvas.close() on every registered canvas, which later
-        # crashes with "Trying to call 'parent' on a destroyed
-        # QWidget" and, more importantly, prevents Slicer from exiting
-        # on Ctrl-C. Restore the standard Python handler so SIGINT
-        # bubbles up to the normal KeyboardInterrupt path and Qt's
-        # event loop can shut down cleanly.
-        try:
-            import signal
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-        except Exception as e:
-            print(f"SIGINT restore failed (non-fatal): {e}")
+        # No SIGINT restore needed: the rendercanvas loop is disabled
+        # at module import time (see the _rc_canvas_group.select_loop(None)
+        # call at the top of this file), so __setup_interrupt_hooks
+        # is never reached and Python's default SIGINT handler stays
+        # in place.
         self._inject_widget()
 
         configure_slicer_controls(self.view.controller)
