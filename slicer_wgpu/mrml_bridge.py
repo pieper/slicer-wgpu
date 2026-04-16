@@ -130,16 +130,30 @@ class _ScreenQRenderWidget(QRenderWidget):
       * win32 (Windows / DXGI): expected to work (well-supported
         wgpu target), enabled
       * linux: DISABLED by default -- wgpu's X11 surface config path
-        panics on some Qt builds ("Error in wgpuSurfaceConfigure:
-        Validation Error", Rust panic, unrecoverable from Python).
-        Falls back to bitmap until the specific surface
-        configuration mismatch is resolved.
+        panics on the container/VNC test environments ("Error in
+        wgpuSurfaceConfigure: Validation Error", Rust panic from
+        wgpu-core, unrecoverable from Python). This is a known
+        upstream state; see:
+          - wgpu-py #776 (exactly this error)
+          - wgpu-py #688 (Qt/Linux WSI meta-issue, maintainer says
+            "wait")
+          - rendercanvas #175 (upstream made bitmap the Qt default
+            in 2026-02 on the strength of async bitmap present in
+            rendercanvas #138)
 
-    Override _SCREEN_ENABLED_PLATFORMS to override the default set per
-    deployment.
+        Falls back to bitmap on Linux until we have a specific
+        Linux platform verified. Expected to work on curated NVIDIA
+        Linux reference systems (DGX Spark / IGX Orin / Holoscan
+        devkits -- Ubuntu 24.04 GNOME-on-Xorg, NVIDIA driver with
+        full VK_KHR_xlib_surface + xcb_surface + wayland_surface,
+        where NVIDIA's own Holoviz runs on Vulkan WSI) -- when
+        testing there, extend _SCREEN_ENABLED_PLATFORMS or flip
+        via env var before first widget construction.
+
+    Subclass and override _SCREEN_ENABLED_PLATFORMS to change the
+    default set per deployment.
     """
 
-    import sys as _sys
     _SCREEN_ENABLED_PLATFORMS = frozenset(("darwin", "win32"))
 
     def _rc_get_present_info(self, present_methods):
