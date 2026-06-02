@@ -40,6 +40,61 @@ _install_pythonqt_shim()
 del _install_pythonqt_shim
 
 
+def _patch_wgpu_offscreen_adapter():
+    """Make OFFSCREEN wgpu adapter requests clear the windowing env during enumeration.
+
+    wgpu enumerates ALL backends when requesting an adapter; its OpenGL backend then picks
+    an EGL *platform* from the environment (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11).
+    On NVIDIA under XWayland (a headless / browser-streamed desktop) BOTH of those abort the
+    process during enumeration -- eglGetPlatformDisplay returns BAD_ACCESS (wayland, wl_drm)
+    or NO_DISPLAY-without-error (x11), and wgpu-hal / khronos-egl panic across the C FFI
+    (unrecoverable; SlicerApp aborts). This bites EVERY offscreen requester -- pygfx's
+    get_shared() (wgpu.gpu.request_adapter_sync) just as much as our own helper.
+
+    Offscreen requests (no canvas) never need a windowing platform, so clear WAYLAND_DISPLAY
+    and DISPLAY for the duration -> the GL backend falls back to surfaceless/device and Vulkan
+    is selected (Vulkan enumeration itself doesn't use a display). On-screen requests (a canvas
+    is passed) genuinely need the surface and are left untouched. No-op where neither var is
+    set (macOS / Windows / real headless), and the vars are restored immediately after.
+    """
+    import os
+    import functools
+    try:
+        import wgpu
+    except Exception:
+        return
+
+    def _wrap(orig, always=False):
+        @functools.wraps(orig)
+        def inner(*args, **kwargs):
+            if not (always or kwargs.get("canvas", None) is None):
+                return orig(*args, **kwargs)
+            saved = {k: os.environ.pop(k, None) for k in ("WAYLAND_DISPLAY", "DISPLAY")}
+            try:
+                return orig(*args, **kwargs)
+            finally:
+                for k, v in saved.items():
+                    if v is not None:
+                        os.environ[k] = v
+        return inner
+
+    gpu = getattr(wgpu, "gpu", None)
+    for owner in (gpu, wgpu):
+        if owner is None:
+            continue
+        for name in ("request_adapter_sync", "request_adapter"):
+            fn = getattr(owner, name, None)
+            if callable(fn):
+                setattr(owner, name, _wrap(fn))
+        for name in ("enumerate_adapters_sync", "enumerate_adapters"):   # no canvas -> offscreen
+            fn = getattr(owner, name, None)
+            if callable(fn):
+                setattr(owner, name, _wrap(fn, always=True))
+
+
+_patch_wgpu_offscreen_adapter()
+del _patch_wgpu_offscreen_adapter
+
 
 # Base submodules — these do NOT depend on rendercanvas, so the offscreen VTK-injection
 # path (which only needs fields/displayers/scene_renderer) stays rendercanvas-free.
