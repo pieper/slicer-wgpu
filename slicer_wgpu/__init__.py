@@ -40,63 +40,51 @@ _install_pythonqt_shim()
 del _install_pythonqt_shim
 
 
-def _patch_wgpu_offscreen_adapter():
-    """Make OFFSCREEN wgpu adapter requests clear the windowing env during enumeration.
+def _force_vulkan_only_wgpu_instance():
+    """On Linux, create the wgpu instance with only the Vulkan backend enabled.
 
-    wgpu enumerates ALL backends when requesting an adapter; its OpenGL backend then picks
-    an EGL *platform* from the environment (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11).
-    On NVIDIA under XWayland (a headless / browser-streamed desktop) BOTH of those abort the
-    process during enumeration -- eglGetPlatformDisplay returns BAD_ACCESS (wayland, wl_drm)
-    or NO_DISPLAY-without-error (x11), and wgpu-hal / khronos-egl panic across the C FFI
-    (unrecoverable; SlicerApp aborts). This bites EVERY offscreen requester -- pygfx's
-    get_shared() (wgpu.gpu.request_adapter_sync) just as much as our own helper.
+    wgpu enumerates EVERY backend when it first creates its instance / requests an adapter.
+    Its OpenGL-ES backend opens an EGL *platform* display chosen from the environment
+    (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11). On NVIDIA under XWayland (a headless /
+    browser-streamed desktop) that EGL probe aborts the whole process -- eglGetPlatformDisplay
+    returns BAD_ACCESS and wgpu-hal panics across the C FFI (unrecoverable; SlicerApp aborts).
+    This bites EVERY requester -- pygfx's get_shared() just as much as our own helper.
 
-    Offscreen requests (no canvas) never need a windowing platform, so clear WAYLAND_DISPLAY
-    and DISPLAY for the duration -> the GL backend falls back to surfaceless/device and Vulkan
-    is selected (Vulkan enumeration itself doesn't use a display). On-screen requests (a canvas
-    is passed) genuinely need the surface and are left untouched. No-op where neither var is
-    set (macOS / Windows / real headless), and the vars are restored immediately after.
+    Clearing the windowing env around the request does NOT help (the GL backend is enumerated
+    regardless of when the env is clear, and WGPU_BACKEND only changes adapter *selection*).
+    The fix is to create the instance with ONLY the Vulkan backend, so the GL/ES backend is
+    never created and its probe never runs. Vulkan WSI still serves offscreen and on-screen
+    surfaces, and DISPLAY is left untouched so VTK/GLX rendering is unaffected.
+
+    Linux-only: macOS uses Metal and Windows uses DX12/Vulkan, where this restriction would
+    remove the only available backend. Override the backend list with
+    SLICER_WGPU_INSTANCE_BACKENDS (comma-separated, e.g. "Vulkan,GL"). Idempotent, and a no-op
+    once the wgpu instance already exists (then it is too late to choose backends).
     """
     import os
-    import functools
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
     try:
         import wgpu
-    except Exception:
-        return
-    if getattr(wgpu, "_desktopia_offscreen_patched", False):
-        return   # already applied (e.g. by SceneRendering before pygfx import)
-
-    def _wrap(orig, always=False):
-        @functools.wraps(orig)
-        def inner(*args, **kwargs):
-            if not (always or kwargs.get("canvas", None) is None):
-                return orig(*args, **kwargs)
-            saved = {k: os.environ.pop(k, None) for k in ("WAYLAND_DISPLAY", "DISPLAY")}
-            try:
-                return orig(*args, **kwargs)
-            finally:
-                for k, v in saved.items():
-                    if v is not None:
-                        os.environ[k] = v
-        return inner
-
-    gpu = getattr(wgpu, "gpu", None)
-    for owner in (gpu, wgpu):
-        if owner is None:
-            continue
-        for name in ("request_adapter_sync", "request_adapter"):
-            fn = getattr(owner, name, None)
-            if callable(fn):
-                setattr(owner, name, _wrap(fn))
-        for name in ("enumerate_adapters_sync", "enumerate_adapters"):   # no canvas -> offscreen
-            fn = getattr(owner, name, None)
-            if callable(fn):
-                setattr(owner, name, _wrap(fn, always=True))
-    wgpu._desktopia_offscreen_patched = True
+        if getattr(wgpu, "_slicer_wgpu_instance_extras_set", False):
+            return
+        from wgpu.backends.wgpu_native import _helpers
+        if _helpers._the_instance is not None:
+            return   # too late -- instance already created with all backends
+        backends = [b.strip() for b in
+                    os.environ.get("SLICER_WGPU_INSTANCE_BACKENDS", "Vulkan").split(",")
+                    if b.strip()]
+        from wgpu.backends.wgpu_native.extras import set_instance_extras
+        set_instance_extras(backends=backends)
+        wgpu._slicer_wgpu_instance_extras_set = True
+    except Exception as exc:
+        print(f"slicer_wgpu: could not restrict wgpu instance to Vulkan: {exc}")
 
 
-_patch_wgpu_offscreen_adapter()
-del _patch_wgpu_offscreen_adapter
+_force_vulkan_only_wgpu_instance()
+del _force_vulkan_only_wgpu_instance
 
 
 # Base submodules — these do NOT depend on rendercanvas, so the offscreen VTK-injection
