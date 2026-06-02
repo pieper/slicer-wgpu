@@ -63,6 +63,8 @@ def _patch_wgpu_offscreen_adapter():
         import wgpu
     except Exception:
         return
+    if getattr(wgpu, "_desktopia_offscreen_patched", False):
+        return   # already applied (e.g. by SceneRendering before pygfx import)
 
     def _wrap(orig, always=False):
         @functools.wraps(orig)
@@ -90,6 +92,7 @@ def _patch_wgpu_offscreen_adapter():
             fn = getattr(owner, name, None)
             if callable(fn):
                 setattr(owner, name, _wrap(fn, always=True))
+    wgpu._desktopia_offscreen_patched = True
 
 
 _patch_wgpu_offscreen_adapter()
