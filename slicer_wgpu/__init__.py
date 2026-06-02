@@ -40,8 +40,26 @@ _install_pythonqt_shim()
 del _install_pythonqt_shim
 
 
-from . import fields, scene_renderer, displayers, mrml_bridge  # noqa: E402
-from . import demos  # noqa: E402
+
+# Base submodules — these do NOT depend on rendercanvas, so the offscreen VTK-injection
+# path (which only needs fields/displayers/scene_renderer) stays rendercanvas-free.
+from . import fields, scene_renderer, displayers  # noqa: E402
+
+# mrml_bridge (DualView / QRenderWidget) and the demos pull in rendercanvas.qt and the whole
+# Qt-canvas / screen-present stack. Import them LAZILY so merely importing slicer_wgpu (or
+# slicer_wgpu.fields) for injection never loads rendercanvas. Explicit access still works:
+# `from slicer_wgpu import mrml_bridge` / `slicer_wgpu.mrml_bridge` trigger the import on demand.
+_LAZY = {"mrml_bridge", "demos"}
+
+
+def __getattr__(name):  # PEP 562 module-level lazy attributes
+    if name in _LAZY:
+        import importlib
+        mod = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = ["fields", "scene_renderer", "displayers", "mrml_bridge", "demos"]
 __version__ = "0.2.0"
