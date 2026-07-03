@@ -129,8 +129,14 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
         return out;
     }
 
-    // Per-pixel jitter to break wood-grain
-    let seed = fract(sin(dot(vec3<f32>(varyings.position.xy, 0.0),
+    // Per-pixel jitter to break wood-grain. Seeded in FULL-FRAME pixel coords: for reduced-res
+    // progressive passes, dither_scale=f and dither_offset=(ox,oy) map this target's pixel (k,l)
+    // to the full-res pixel (f*k+ox, f*l+oy) it corresponds to — so interleaved passes reproduce
+    // the SAME per-pixel seed field as a native full-res render. Without this, all f*f pixels of
+    // a block share one ray-start offset, which is visible 3x3 blockiness on detailed data.
+    // Defaults (scale=1, offset=0) are a no-op for normal renders.
+    let dpos = varyings.position.xy * u_material.dither_scale + u_material.dither_offset.xy;
+    let seed = fract(sin(dot(vec3<f32>(dpos, 0.0),
                               vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
     var t = t_near + seed * step;
 
@@ -144,6 +150,15 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
         if (integrated.a >= 0.99){ break; }
 
         let wp = ray_origin + ray_dir * t;
+
+        // Space-skipping: all compositing fields must agree to skip.
+        var min_skip: f32 = 1e30;
+__SKIP_CHECKS__
+        if (min_skip > step * 1.5) {
+            t = t + min_skip;
+            safety = safety + 1;
+            continue;
+        }
 
         // Combine all fields at this sample point. Per-sample compositing
         // is STEP-style: each field contributes its own (color, opacity);
@@ -168,6 +183,18 @@ __FIELD_DISPATCH__
 
         t = t + step;
         safety = safety + 1;
+    }
+
+    // Step-count heatmap debug mode: blue=few steps, red=many, green=mid.
+    if (u_material.debug_step_count > 0.5) {
+        let norm = f32(safety) / f32(max_steps);
+        let heat = vec3<f32>(
+            clamp(norm * 3.0, 0.0, 1.0),
+            clamp(norm * 3.0 - 1.0, 0.0, 1.0),
+            clamp(norm * 3.0 - 2.0, 0.0, 1.0),
+        );
+        out.color = vec4<f32>(heat, 1.0);
+        return out;
     }
 
     let bg = srgb2physical(u_material.background.rgb);
@@ -198,11 +225,35 @@ def _build_field_dispatch_block(fields: list[Field], slot_indices: list[int]) ->
     return "\n".join(lines)
 
 
+def _build_skip_checks_block(fields: list[Field], slot_indices: list[int]) -> str:
+    """Emit per-field skip checks. If ALL compositing fields provide a skip
+    function, the ray can advance past empty regions. If any compositing
+    field lacks skip support, skipping is disabled (min_skip stays 0).
+    """
+    lines = []
+    for field, slot in zip(fields, slot_indices):
+        if not field.is_compositing:
+            continue
+        skip_src = field.skip_wgsl(slot)
+        if skip_src is None:
+            # This compositing field has no skip function — can't skip.
+            lines = [f"        min_skip = 0.0;  // {field.field_kind}{slot} has no skip"]
+            return "\n".join(lines)
+        fn = f"skip_field_{field.field_kind}{slot}"
+        lines.append(f"        min_skip = min(min_skip, {fn}(wp, ray_dir));")
+    if not lines:
+        lines.append("        // (no compositing fields — skip everything)")
+    return "\n".join(lines)
+
+
 def _build_field_functions_block(fields: list[Field], slot_indices: list[int]) -> str:
     chunks = []
     for field, slot in zip(fields, slot_indices):
         chunks.append(field.sampling_wgsl(slot))
         chunks.append(field.tf_wgsl(slot))
+        skip_src = field.skip_wgsl(slot)
+        if skip_src is not None:
+            chunks.append(skip_src)
     return "\n".join(chunks)
 
 
@@ -289,6 +340,7 @@ class SceneMaterial(pygfx.Material):
         self.fill_light_direction = (0.0, 0.0, 0.0, 0.0)
         self.fill_light_intensity = 0.0
         self.sample_step = 1.0
+        self.debug_step_count = 0.0
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -357,6 +409,21 @@ class SceneMaterial(pygfx.Material):
         self.uniform_buffer.data["fill_light_intensity"] = float(v)
         self.uniform_buffer.update_full()
 
+    @property
+    def debug_step_count(self):
+        return float(self.uniform_buffer.data["debug_step_count"])
+    @debug_step_count.setter
+    def debug_step_count(self, v):
+        self.uniform_buffer.data["debug_step_count"] = float(v)
+        self.uniform_buffer.update_full()
+
+    def set_dither_mapping(self, scale=1.0, ox=0.0, oy=0.0):
+        """Map this target's pixel coords to full-frame coords for the dither seed
+        (progressive refinement sets (f, ox, oy) per pass; (1,0,0) = identity/native)."""
+        self.uniform_buffer.data["dither_scale"] = float(scale)
+        self._set_vec4("dither_offset", (float(ox), float(oy), 0.0))
+        self.uniform_buffer.update_full()
+
 
 def make_material_class(fields: list[Field], slot_indices: list[int],
                         transform_fields: list | None = None):
@@ -389,15 +456,25 @@ def make_material_class(fields: list[Field], slot_indices: list[int],
     # Optional fill light (unshadowed, intensity-scaled). xyz is the
     # surface-to-light direction; intensity==0 disables the fill term.
     uniform_type["fill_light_direction"]  = "4xf4"
+    # Dither seed mapping to full-frame pixel coords (see the seed WGSL): identity by default,
+    # set per-pass by progressive refinement so interleaved reduced renders share the native
+    # per-pixel seed field. vec4 (xy used) grouped with the other vec4s for alignment.
+    uniform_type["dither_offset"]         = "4xf4"
     uniform_type["light_intensity"]       = "f4"
     uniform_type["fill_light_intensity"]  = "f4"
     uniform_type["sample_step"]           = "f4"
+    uniform_type["debug_step_count"]      = "f4"
+    uniform_type["dither_scale"]          = "f4"
 
-    # Per-field uniforms
+    # Per-field uniforms (main + skip)
     for field, slot in zip(fields, slot_indices):
         for k, t in field.uniform_type(slot).items():
             if k in uniform_type:
                 raise ValueError(f"Uniform name collision: {k!r}")
+            uniform_type[k] = t
+        for k, t in field.skip_uniform_type(slot).items():
+            if k in uniform_type:
+                raise ValueError(f"Skip uniform name collision: {k!r}")
             uniform_type[k] = t
 
     # TransformField uniforms (one slot per deduplicated TF). TFs also
@@ -542,6 +619,7 @@ class SceneRenderer(pygfx.WorldObject):
             _SHADER_TEMPLATE
             .replace("__SAMPLE_SHADOW_FN__", sample_shadow_src)
             .replace("__FIELD_FUNCTIONS__", field_functions)
+            .replace("__SKIP_CHECKS__",     _build_skip_checks_block(fields, slot_indices))
             .replace("__FIELD_DISPATCH__",  _build_field_dispatch_block(fields, slot_indices))
         )
 
@@ -569,9 +647,10 @@ class SceneRenderer(pygfx.WorldObject):
                     Binding("u_wobject",  "buffer/uniform", wobject.uniform_buffer),
                     Binding("u_material", "buffer/uniform", wobject.material.uniform_buffer),
                 ]
-                # Per-field bindings (textures, samplers).
+                # Per-field bindings (textures, samplers) + skip bindings.
                 for f, s in zip(wobject._fields, wobject._slot_indices):
                     bindings.extend(f.get_bindings(s))
+                    bindings.extend(f.skip_bindings(s))
                 # TransformField bindings (shared across receivers).
                 for tf_slot, tf in enumerate(
                         getattr(wobject, "_transform_fields", ()) or ()):
@@ -605,6 +684,7 @@ class SceneRenderer(pygfx.WorldObject):
         _SceneShader.__qualname__ = _shader_cls_name
 
         material = mat_cls()
+        material.set_dither_mapping(1.0, 0.0, 0.0)   # identity: numpy zero-init would give scale=0
         renderer = obj_cls(material)
         renderer._fields = fields
         renderer._shadow_volume = shadow_volume
@@ -649,6 +729,7 @@ class SceneRenderer(pygfx.WorldObject):
         change). Does not regenerate the shader."""
         for f, s in zip(self._fields, self._slot_indices):
             f.fill_uniforms(self.material.uniform_buffer, s)
+            f.fill_skip_uniforms(self.material.uniform_buffer, s)
         for i, tf in enumerate(getattr(self, "_transform_fields", ()) or ()):
             tf.fill_uniforms(self.material.uniform_buffer, i)
         self.material.uniform_buffer.update_full()
@@ -671,7 +752,17 @@ class SceneRenderer(pygfx.WorldObject):
         return changed
 
     def recompute_scene_bounds(self) -> None:
-        boxes = [f.aabb() for f in self._fields]
+        # Only include visible compositing fields in the scene AABB
+        # and step-size calculation. Invisible fields still participate
+        # in space-skipping (their skip function returns 1e30) but
+        # shouldn't inflate the march range or force a tiny step size.
+        visible = [f for f in self._fields
+                   if getattr(f, "visible", True) and f.is_compositing]
+        # Fall back to all compositing fields if none are visible
+        # (avoids degenerate empty bounds).
+        if not visible:
+            visible = [f for f in self._fields if f.is_compositing]
+        boxes = [f.aabb() for f in visible]
         boxes = [b for b in boxes if b is not None]
         if not boxes:
             return
@@ -681,10 +772,10 @@ class SceneRenderer(pygfx.WorldObject):
         pad = (hi - lo).max() * 0.01
         self.material.scene_bounds_min = tuple(lo - pad)
         self.material.scene_bounds_max = tuple(hi + pad)
-        # Sample step: smallest of any field's preferred step (or 1mm
-        # default for fields that don't have one).
+        # Sample step: smallest of any visible field's preferred step
+        # (or 1mm default for fields that don't have one).
         steps = []
-        for f in self._fields:
+        for f in visible:
             if hasattr(f, "sample_step_mm"):
                 steps.append(f.sample_step_mm)
         if steps:

@@ -87,15 +87,16 @@ _force_vulkan_only_wgpu_instance()
 del _force_vulkan_only_wgpu_instance
 
 
-# Base submodules — these do NOT depend on rendercanvas, so the offscreen VTK-injection
-# path (which only needs fields/displayers/scene_renderer) stays rendercanvas-free.
-from . import fields, scene_renderer, displayers  # noqa: E402
+# Base submodules — fields + scene_renderer import only numpy/pygfx/wgpu (their slicer/vtk
+# use is function-scoped), so importing slicer_wgpu stays usable in a bare, Slicer-free
+# container (e.g. the headless remote renderer on modal). See slicer_wgpu.headless.
+from . import fields, scene_renderer  # noqa: E402
 
-# mrml_bridge (DualView / QRenderWidget) and the demos pull in rendercanvas.qt and the whole
-# Qt-canvas / screen-present stack. Import them LAZILY so merely importing slicer_wgpu (or
-# slicer_wgpu.fields) for injection never loads rendercanvas. Explicit access still works:
-# `from slicer_wgpu import mrml_bridge` / `slicer_wgpu.mrml_bridge` trigger the import on demand.
-_LAZY = {"mrml_bridge", "demos"}
+# displayers, mrml_bridge and demos import Slicer (`import slicer`/`vtk`) and/or
+# rendercanvas.qt at module scope. Import them LAZILY so merely importing slicer_wgpu (for
+# the offscreen VTK-injection path or the headless renderer) never requires Slicer/Qt.
+# Explicit access still works: `from slicer_wgpu import displayers` triggers it on demand.
+_LAZY = {"displayers", "mrml_bridge", "demos"}
 
 
 def __getattr__(name):  # PEP 562 module-level lazy attributes

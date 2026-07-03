@@ -129,6 +129,19 @@ fn compute_gradient_world(wp: vec3<f32>, h_mm: f32) -> vec3<f32> {
 fn fs_main(varyings: Varyings) -> FragmentOutput {
     var out: FragmentOutput;
 
+    // Adaptive selective casting (v0): skip a stochastic fraction of pixels BEFORE the
+    // expensive ray march. budget=1 -> cast every pixel (no change). frame_seed rotates the
+    // set so successive frames cover different pixels (basis for temporal accumulation).
+    if (u_material.sample_budget < 0.999) {
+        let pp = varyings.position.xy;
+        let h = fract(sin(dot(pp + vec2<f32>(u_material.frame_seed, u_material.frame_seed * 1.37),
+                              vec2<f32>(12.9898, 78.233))) * 43758.5453);
+        if (h > u_material.sample_budget) {
+            out.color = u_material.background;   // hole -> reconstructed / accumulated later
+            return out;
+        }
+    }
+
     // @builtin(position) is in framebuffer pixels (physical). Convert to NDC.
     let size = u_stdinfo.physical_size;
     let ndc_x = (varyings.position.x / size.x) * 2.0 - 1.0;
@@ -173,8 +186,12 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
         return out;
     }
 
-    // Per-pixel jitter to kill wood-grain
-    let seed = fract(sin(dot(vec3<f32>(varyings.position.xy, 0.0),
+    // Per-pixel jitter to kill wood-grain, seeded in FULL-FRAME pixel coords (see scene_renderer:
+    // progressive passes set dither_scale=f, offset=(ox,oy) so interleaved reduced renders share
+    // the native per-pixel seed field; identity (1,0,0) otherwise).
+    let dpos = varyings.position.xy * u_material.dither_scale
+               + vec2<f32>(u_material.dither_ox, u_material.dither_oy);
+    let seed = fract(sin(dot(vec3<f32>(dpos, 0.0),
                               vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
     var t = t_near + seed * step;
 
@@ -290,6 +307,11 @@ class SlicerVolumeMaterial(pygfx.Material):
         k_diffuse="f4",
         k_specular="f4",
         shininess="f4",
+        sample_budget="f4",   # adaptive: fraction of pixels to actually ray-cast (1 = all)
+        frame_seed="f4",      # rotates the stochastic sample set frame-to-frame
+        dither_scale="f4",    # dither seed mapping to full-frame coords (progressive passes):
+        dither_ox="f4",       #   seed pos = position.xy * dither_scale + (dither_ox, dither_oy);
+        dither_oy="f4",       #   identity (1,0,0) for normal renders
         _pad="f4",
     )
 
@@ -315,6 +337,11 @@ class SlicerVolumeMaterial(pygfx.Material):
         self.k_diffuse = 0.7
         self.k_specular = 0.2
         self.shininess = 10.0
+        self.sample_budget = 1.0
+        self.frame_seed = 0.0
+        self.dither_scale = 1.0
+        self.dither_ox = 0.0
+        self.dither_oy = 0.0
         self.background = (0.5, 0.5, 0.7, 1.0)
         self.patient_to_texture = np.eye(4, dtype=np.float32)
 
@@ -353,6 +380,11 @@ class SlicerVolumeMaterial(pygfx.Material):
     k_diffuse             = _sprop("k_diffuse")
     k_specular            = _sprop("k_specular")
     shininess             = _sprop("shininess")
+    sample_budget         = _sprop("sample_budget")
+    frame_seed            = _sprop("frame_seed")
+    dither_scale          = _sprop("dither_scale")
+    dither_ox             = _sprop("dither_ox")
+    dither_oy             = _sprop("dither_oy")
     del _sprop
 
     @property
