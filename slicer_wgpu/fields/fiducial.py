@@ -67,6 +67,11 @@ class FiducialField(Field):
         self.k_diffuse = float(k_diffuse)
         self.k_specular = float(k_specular)
         self.visible = bool(visible)
+        # Step size for the ray-march when this is the finest-resolution
+        # visible field. 1.0 mm is adequate for typical markup spheres
+        # (radius ~3-10 mm); the SDF skip function jumps over empty space
+        # so the step only matters near sphere surfaces.
+        self.sample_step_mm = 1.0
 
     # -------- Mutation --------
 
@@ -219,6 +224,27 @@ fn sample_field_fid{i}(wp: vec3<f32>, ray_dir: vec3<f32>, ray_origin: vec3<f32>)
         return f"""
 fn tf_field_fid{i}(s: FieldSample) -> vec4<f32> {{
     return vec4<f32>(s.color_srgb, s.opacity);
+}}
+"""
+
+    # -------- Space-skipping --------
+
+    def skip_wgsl(self, slot_idx: int) -> str | None:
+        i = slot_idx
+        return f"""
+fn skip_field_fid{i}(wp: vec3<f32>, ray_dir: vec3<f32>) -> f32 {{
+    if (u_material.fid{i}_visible < 0.5) {{ return 1e30; }}
+    let wp_r = transform_point_fid{i}(wp);
+    let n = i32(u_material.fid{i}_n_spheres);
+    var min_dist: f32 = 1e30;
+    for (var k = 0; k < n; k = k + 1) {{
+        let sp = u_material.fid{i}_spheres[k];
+        let r = sp.w;
+        if (r <= 0.0) {{ continue; }}
+        let d = length(wp_r - sp.xyz) - r;
+        min_dist = min(min_dist, d);
+    }}
+    return max(min_dist, 0.0);
 }}
 """
 

@@ -76,6 +76,7 @@ class TransformField(Field):
     """
 
     field_kind = "grid"
+    is_compositing = False
 
     def __init__(self,
                  displacement_array: np.ndarray | None = None,

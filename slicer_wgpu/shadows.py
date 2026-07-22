@@ -268,6 +268,28 @@ class ShadowVolume:
         self._n_fields = 0
         self._per_field_ubos: list = []      # wgpu.GPUBuffer, one per field
 
+        # Profiling: GPU timestamp queries (lazily created if device supports it)
+        self._query_set = None
+        self._query_buf = None
+        self.last_gpu_time_ns: int | None = None
+        self._init_profiling()
+
+    def _init_profiling(self):
+        """Create GPU timestamp query resources if the device supports it."""
+        if "timestamp-query" not in self.device.features:
+            return
+        try:
+            self._query_set = self.device.create_query_set(
+                type=wgpu.QueryType.timestamp, count=2)
+            self._query_buf = self.device.create_buffer(
+                label="slicer_wgpu.ShadowVolume.query_buf",
+                size=16,  # 2 × uint64
+                usage=wgpu.BufferUsage.QUERY_RESOLVE | wgpu.BufferUsage.COPY_SRC,
+            )
+        except Exception:
+            self._query_set = None
+            self._query_buf = None
+
     # -------- Pipeline lifecycle --------
 
     def build_pipeline_for_image_fields(self, image_fields: Sequence) -> None:
@@ -486,12 +508,29 @@ class ShadowVolume:
 
         encoder = self.device.create_command_encoder(
             label="slicer_wgpu.ShadowVolume.encoder")
+        ts_kwargs = {}
+        if self._query_set is not None:
+            ts_kwargs["timestamp_writes"] = {
+                "query_set": self._query_set,
+                "beginning_of_pass_write_index": 0,
+                "end_of_pass_write_index": 1,
+            }
         cpass = encoder.begin_compute_pass(
-            label="slicer_wgpu.ShadowVolume.pass")
+            label="slicer_wgpu.ShadowVolume.pass", **ts_kwargs)
         cpass.set_pipeline(self._pipeline)
         cpass.set_bind_group(0, bind_group, [], 0, 0)
         wg = 4
         groups = (self.resolution + wg - 1) // wg
         cpass.dispatch_workgroups(groups, groups, groups)
         cpass.end()
+        if self._query_set is not None:
+            encoder.resolve_query_set(
+                self._query_set, 0, 2, self._query_buf, 0)
         self.device.queue.submit([encoder.finish()])
+        if self._query_buf is not None:
+            try:
+                raw = self.device.queue.read_buffer(self._query_buf)
+                ts = __import__("numpy").frombuffer(raw, dtype="uint64")
+                self.last_gpu_time_ns = int(ts[1] - ts[0])
+            except Exception:
+                self.last_gpu_time_ns = None

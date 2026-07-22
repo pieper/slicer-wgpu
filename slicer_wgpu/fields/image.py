@@ -167,6 +167,13 @@ class ImageField(Field):
         self.shininess = float(shininess)
         self.visible = bool(visible)
 
+        # Space-skipping occupancy textures (lazily built).
+        self._skip_minmax_tex = None    # wgpu.GPUTexture, rg32float, 32^3
+        self._skip_alpha_tex = None     # pygfx.Texture, r8unorm, 32^3
+        self._skip_alpha_data = None    # numpy uint8, for CPU rebuild on TF change
+        self._skip_block_res = 32
+        self._skip_block_diag_mm = 0.0  # world-space block diagonal
+
     # -------- Construction from MRML --------
 
     @classmethod
@@ -405,6 +412,140 @@ fn tf_field_img{i}(s: FieldSample) -> vec4<f32> {{
     return vec4<f32>(s.color_srgb, s.opacity);
 }}
 """
+
+    # -------- Space-skipping --------
+
+    def skip_wgsl(self, slot_idx: int) -> str | None:
+        if self._skip_alpha_tex is None:
+            return None
+        i = slot_idx
+        return f"""
+fn skip_field_img{i}(wp: vec3<f32>, ray_dir: vec3<f32>) -> f32 {{
+    if (u_material.img{i}_visible < 0.5) {{ return 1e30; }}
+    let wp_r = transform_point_img{i}(wp);
+    let tex4 = u_material.img{i}_patient_to_texture * vec4<f32>(wp_r, 1.0);
+    let uvw = tex4.xyz;
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) {{
+        return 1e30;
+    }}
+    let occ = textureSample(t_skip_alpha{i}, s_skip{i}, uvw).r;
+    if (occ < 0.5) {{
+        return u_material.img{i}_skip_block_diag;
+    }}
+    return 0.0;
+}}
+"""
+
+    def skip_bindings(self, slot_idx: int) -> list:
+        if self._skip_alpha_tex is None:
+            return []
+        from pygfx.renderers.wgpu import Binding, GfxSampler, GfxTextureView
+        FRAGMENT_ONLY = "fragment"
+        return [
+            Binding(f"s_skip{slot_idx}", "sampler/filtering",
+                    GfxSampler("linear", "clamp"), FRAGMENT_ONLY),
+            Binding(f"t_skip_alpha{slot_idx}", "texture/auto",
+                    GfxTextureView(self._skip_alpha_tex), FRAGMENT_ONLY),
+        ]
+
+    def skip_uniform_type(self, slot_idx: int) -> dict:
+        if self._skip_alpha_tex is None:
+            return {}
+        return {f"img{slot_idx}_skip_block_diag": "f4"}
+
+    def fill_skip_uniforms(self, ub, slot_idx: int) -> None:
+        if self._skip_alpha_tex is None:
+            return
+        ub.data[f"img{slot_idx}_skip_block_diag"] = np.float32(
+            self._skip_block_diag_mm)
+
+    def build_skip_textures(self, device) -> None:
+        """Build the min/max block texture and initial alpha mask.
+
+        Call once after the volume texture is uploaded to the GPU, and
+        again if the volume data changes (rare).
+        """
+        if self._volume_tex is None:
+            return
+        from .skip_compute import BlockMinMaxBuilder, build_block_alpha
+
+        builder = BlockMinMaxBuilder(device, self._skip_block_res)
+        self._skip_minmax_tex = builder.build(self._volume_tex)
+
+        # Compute block diagonal in world-space mm.
+        vol_data = self._volume_tex.data
+        R = self._skip_block_res
+        bw = max((vol_data.shape[2] + R - 1) // R, 1)
+        bh = max((vol_data.shape[1] + R - 1) // R, 1)
+        bd = max((vol_data.shape[0] + R - 1) // R, 1)
+        # patient_to_texture maps mm → [0,1]; invert to get mm/voxel.
+        p2t = np.asarray(self.patient_to_texture, dtype=np.float64)
+        try:
+            t2p = np.linalg.inv(p2t)
+        except np.linalg.LinAlgError:
+            t2p = np.eye(4, dtype=np.float64)
+        # Spacing along each axis (length of rows of upper-3x3 of t2p).
+        sx = np.linalg.norm(t2p[:3, 0])
+        sy = np.linalg.norm(t2p[:3, 1])
+        sz = np.linalg.norm(t2p[:3, 2])
+        # Block extent in mm along each axis.
+        ex = bw * sx / max(vol_data.shape[2], 1)
+        ey = bh * sy / max(vol_data.shape[1], 1)
+        ez = bd * sz / max(vol_data.shape[0], 1)
+        self._skip_block_diag_mm = float(np.sqrt(ex**2 + ey**2 + ez**2))
+
+        # Read back min/max and build the alpha mask with the current TF.
+        self._rebuild_skip_alpha()
+
+    def _rebuild_skip_alpha(self) -> None:
+        """(Re)build the per-block alpha mask from the current TF LUT.
+
+        Called on TF change and after initial min/max build.
+        """
+        if self._skip_minmax_tex is None or self._lut_tex is None:
+            return
+        from .skip_compute import build_block_alpha
+
+        # Read back the min/max texture.
+        R = self._skip_block_res
+        minmax_tex = self._skip_minmax_tex
+        buf = minmax_tex._device.create_buffer(
+            size=R * R * R * 8,  # rg32float = 8 bytes/texel
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
+        bpr = R * 8
+        aligned_bpr = (bpr + 255) & ~255
+        encoder = minmax_tex._device.create_command_encoder()
+        encoder.copy_texture_to_buffer(
+            {"texture": minmax_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            {"buffer": buf, "offset": 0,
+             "bytes_per_row": aligned_bpr, "rows_per_image": R},
+            (R, R, R))
+        minmax_tex._device.queue.submit([encoder.finish()])
+        raw = minmax_tex._device.queue.read_buffer(buf)
+        # Unpad rows if needed.
+        raw_arr = np.frombuffer(raw, dtype=np.float32)
+        if aligned_bpr != bpr:
+            raw_arr = raw_arr.reshape(R * R, aligned_bpr // 4)[:, :R * 2]
+        minmax_data = raw_arr.reshape(R, R, R, 2)
+
+        lut_arr = self._lut_tex.data
+        alpha_mask = build_block_alpha(minmax_data, lut_arr, self.clim)
+
+        # Upload as a pygfx.Texture for binding in the fragment shader.
+        if self._skip_alpha_tex is None:
+            self._skip_alpha_tex = pygfx.Texture(
+                alpha_mask.astype(np.float32),
+                dim=3)
+            self._skip_alpha_tex._wgpu_usage |= wgpu.TextureUsage.TEXTURE_BINDING
+        else:
+            self._skip_alpha_tex.set_data(
+                alpha_mask.astype(np.float32))
+        self._skip_alpha_data = alpha_mask
+        self.touch()
+
+    def update_skip_alpha(self) -> None:
+        """Public entry point to rebuild the alpha mask after a TF change."""
+        self._rebuild_skip_alpha()
 
     # -------- TF fast path --------
 

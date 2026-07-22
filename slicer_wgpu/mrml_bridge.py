@@ -925,8 +925,16 @@ class SceneRendererManager:
         for f, s in zip(self._renderer.fields(), self._renderer._slot_indices):
             if f is field:
                 f.fill_uniforms(self._renderer.material.uniform_buffer, s)
+                f.fill_skip_uniforms(self._renderer.material.uniform_buffer, s)
         self._renderer.material.uniform_buffer.update_full()
         self._renderer.recompute_scene_bounds()
+        # Rebuild skip-alpha mask on TF change (cheap, CPU-side).
+        from .fields.image import ImageField
+        if isinstance(field, ImageField) and field._skip_alpha_tex is not None:
+            try:
+                field.update_skip_alpha()
+            except Exception as e:
+                print(f"SceneRendererManager: skip alpha rebuild failed: {e}")
         # Shadows depend on TF + transform + scene bounds, all of which may
         # just have changed. Rebuild the transmittance volume too -- but
         # only when we're not mid-drag, where the user cares about
@@ -1032,6 +1040,17 @@ class SceneRendererManager:
                 shadow_volume = sv
             except Exception as e:
                 print(f"SceneRendererManager: shadow pipeline build failed: {e}")
+
+        # Build space-skipping occupancy textures for ImageFields.
+        if image_fields:
+            try:
+                from pygfx.renderers.wgpu.engine.shared import get_shared
+                dev = get_shared().device
+                for imf in image_fields:
+                    if imf._skip_alpha_tex is None:
+                        imf.build_skip_textures(dev)
+            except Exception as e:
+                print(f"SceneRendererManager: skip texture build failed: {e}")
 
         try:
             self._renderer = SceneRenderer.build_for_fields(

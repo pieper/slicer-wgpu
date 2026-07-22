@@ -137,6 +137,39 @@ class Field(ABC):
     def touch(self) -> None:
         self._mtime += 1
 
+    # ---- Space-skipping (optional) ----
+
+    @property
+    def is_compositing(self) -> bool:
+        """True if this field contributes color/opacity along the ray.
+        TransformField overrides to False (it only warps sample positions)."""
+        return True
+
+    def skip_wgsl(self, slot_idx: int) -> str | None:
+        """WGSL defining ``skip_field_<kind><slot>(wp, ray_dir) -> f32``.
+
+        Returns the safe distance to advance along the ray without
+        missing any non-zero opacity from this field. Return 0.0 if the
+        field may contribute at ``wp``.
+
+        Return ``None`` (the default) to signal that this field has no
+        space-skipping support. If ANY compositing field returns None,
+        skipping is disabled for the entire scene.
+        """
+        return None
+
+    def skip_bindings(self, slot_idx: int) -> list:
+        """Bindings for skip-related textures (e.g., occupancy maps)."""
+        return []
+
+    def skip_uniform_type(self, slot_idx: int) -> dict:
+        """Per-slot uniform fields for skip parameters."""
+        return {}
+
+    def fill_skip_uniforms(self, uniform_buffer, slot_idx: int) -> None:
+        """Write skip-related uniforms. Default no-op."""
+        pass
+
     # ---- Optional structural / shader-cache hint ----
 
     def shader_signature(self, slot_idx: int) -> str:
