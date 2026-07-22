@@ -197,7 +197,7 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
 
     var integrated = vec4<f32>(0.0);
     var safety: i32 = 0;
-    let max_steps: i32 = 2048;
+    let max_steps: i32 = 5000;   // cover the voxel-fine diagonal of high-res microCT (L1 bee ~2500)
 
     let k_a = u_material.k_ambient;
     let k_d = u_material.k_diffuse;
@@ -217,7 +217,16 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
             let grad = compute_gradient_world(wp, step);
             let grad_len = length(grad);
 
-            var opacity = base_a * (step / unit);
+            // VTK-exact opacity-distance correction: alpha = 1 - (1 - a)^(step/unit)
+            // (vtkOpenGLVolumeOpacityTable). The old linear approximation a*(step/unit)
+            // under-accumulates the high-opacity end of the TF when step/unit is tiny
+            // (fine-voxel microCT: step~0.01mm, unit~1mm -> factor~0.01), so dense cuticle
+            // that VTK renders as an opaque crisp surface (1-(1-1)^0.01 = 1.0) instead
+            // stayed translucent (1.0*0.01 = 0.01/sample) -> the pale, fuzzy cloud. On
+            // coarse voxels (human CT, factor~0.5-1) the two forms nearly coincide, which
+            // is why those looked fine. Gradient opacity multiplies AFTER and is NOT
+            // distance-corrected, matching VTK.
+            var opacity = 1.0 - pow(1.0 - clamp(base_a, 0.0, 1.0), step / unit);
             if (u_material.gradient_opacity_enabled > 0.5) {
                 let gmin = u_material.gradient_range.x;
                 let gmax = max(u_material.gradient_range.y, gmin + 1e-6);
@@ -286,6 +295,24 @@ fn fs_main(varyings: Varyings) -> FragmentOutput {
 # ------------------------------------------------------------------------
 # Material
 # ------------------------------------------------------------------------
+
+
+def _reuse_texture(old, new):
+    """Update a bound texture IN PLACE when possible instead of swapping the object.
+
+    pygfx builds the bind group once (first render) and does NOT rebuild it when a texture
+    attribute is reassigned to a fresh Texture object — so replacing lut/grad_lut with a new
+    Texture is silently ignored after the first frame (the shader keeps sampling the original).
+    If the incoming texture matches the existing one's shape, copy its bytes into the SAME object
+    and mark it dirty (update_full), so the already-bound texture is re-uploaded and the change
+    actually reaches the GPU. Fall back to a real swap on first set or a shape change (a shape
+    change forces pygfx to rebuild the bind group anyway)."""
+    if old is not None and new is not None and tuple(old.data.shape) == tuple(new.data.shape):
+        np.copyto(old.data, new.data)
+        old.update_full()
+        return old
+    return new
+
 
 class SlicerVolumeMaterial(pygfx.Material):
     """Single-volume material for the STEP-port renderer."""
@@ -447,12 +474,12 @@ class SlicerVolumeMaterial(pygfx.Material):
     @property
     def lut_texture(self): return self._lut_tex
     @lut_texture.setter
-    def lut_texture(self, tex): self._lut_tex = tex
+    def lut_texture(self, tex): self._lut_tex = _reuse_texture(self._lut_tex, tex)
 
     @property
     def grad_lut_texture(self): return self._grad_lut_tex
     @grad_lut_texture.setter
-    def grad_lut_texture(self, tex): self._grad_lut_tex = tex
+    def grad_lut_texture(self, tex): self._grad_lut_tex = _reuse_texture(self._grad_lut_tex, tex)
 
     @property
     def interpolation(self): return self._interpolation
